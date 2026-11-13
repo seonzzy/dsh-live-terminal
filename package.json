@@ -1,0 +1,65 @@
+{
+  "name": "dsh-live-terminal",
+  "version": "1.0.0",
+  "description": "A shared live terminal: the agent drives it through tools, and the same session is mirrored in a panel you can watch and type into.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "vendor/*",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "THIRD-PARTY-NOTICES.md"
+  ],
+  "icon": "./icon.svg",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "terminal",
+    "pty",
+    "shell",
+    "xterm",
+    "ssh",
+    "agent-tools"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seonzzy/dsh-live-terminal.git"
+  },
+  "homepage": "https://github.com/seonzzy/dsh-live-terminal#readme",
+  "bugs": {
+    "url": "https://github.com/seonzzy/dsh-live-terminal/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.1"
+  }
+}

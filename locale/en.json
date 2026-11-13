@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Live terminal",
+    "description": "A real terminal the agent drives through tools while the same screen is mirrored to you — you can type into it too, and ssh, vim and tmux behave normally."
+  }
+}

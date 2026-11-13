@@ -1,0 +1,7 @@
+# Bundle layer for dsh-live-terminal.
+#
+# One Host row hosts the PTY pool, the HTTP mirror, and the model-facing tools.
+# The browser half registers the sidebar entry and the panel it opens.
+- insert:
+    - id: live-terminal
+      name: dsh-live-terminal
