@@ -60,6 +60,6 @@
     "url": "https://github.com/seonzzy/dsh-live-terminal/issues"
   },
   "engines": {
-    "dsh": ">=0.2.1"
+    "dsh": ">=0.2.1 <0.3.0"
   }
 }
