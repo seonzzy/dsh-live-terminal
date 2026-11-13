@@ -37,22 +37,21 @@ Host 侧是一张以 session id 为键的表：
 
 两者是同一个键，所以「模型在跑的命令」和「你在看的面板」永远是同一条 PTY。一个 host 进程最多同时保留 8 条，最久没动静的那条会被回收。
 
-## 和 Better Sidebar 的关系
+## 面板挂在哪
 
-面板是 **Better Sidebar 的一个页签**，用的是它开放给所有插件的接口：
+面板是 **DSH 自带右侧栏的一个页签**，只注册一次：
 
 ```js
-ctx.inject(['betterSidebar'], (sctx) => {
-  sctx.effect(() => sctx.get('betterSidebar').registerTab({
-    id: 'live-terminal',
-    title: () => '实时终端',
-    single: true,
-    component: ({ scope }) => <Pane sessionId={scope.sessionId} cwd={scope.cwd} />,
-  }));
-});
+ctx.sidebarRightTabs.register({ id, kind, title, guide: [...] })   // 声明类型
+ctx.slots.register({ name: 'sidebar.right.pane.tab',       key: id }, Body)
+ctx.slots.register({ name: 'sidebar.right.pane.tab.title', key: id }, Title)
 ```
 
-`ctx.inject` 是客户端的**可选服务**接缝：服务出现时才执行，被禁用时连同注册一起撤掉，所以两个插件的加载顺序无关紧要。Better Sidebar 不在时，会退回插件自己的侧栏入口 + 主面板，终端照样可用。
+三件缺一不可：类型没人分发就渲染不出来，内容槽没有类型就永远不会被打开。
+
+**不依赖 Better Sidebar。** 这条通路由宿主自己提供，所以装、不装、中途卸载 Better Sidebar，入口都是同一个、永远在、只出现一次。此前两套都注册会让同一块面板在侧栏里出现两次，那是要避免的。
+
+自动打开用 `sidebarRight.openTabIn(sessionId, kind, ...)` 而不是 `openTab(kind)`：后者取「当前挂到栏上的会话」，而侧栏关着时没人挂上去，调用会静默失效——偏偏那正是最需要它生效的场景。
 
 ## 工具
 
@@ -79,7 +78,7 @@ ctx.inject(['betterSidebar'], (sctx) => {
 
 ```
 index.js               Host：PTY 表、权威屏幕、路由、工具
-client.js              浏览器：Better Sidebar 页签 + 自绘回退
+client.js              浏览器：DSH 右侧栏页签 + 终端画布
 vendor/xterm.js        终端模拟器 6.0.0（MIT，见 THIRD-PARTY-NOTICES.md）
 vendor/xterm.css
 vendor/addon-fit.js    尺寸自适应 0.11.0
@@ -91,9 +90,10 @@ icon.svg               插件图标
 ## 说明
 
 - PTY 通过已挂载的 `subprocess` 服务创建，shell、工作目录、进程树 containment 都跟随本机其余部分的同一套规则。
-- 从面板点「启动」时，`scope.cwd` 会随请求带上——路由里看不到 agent 作用域，没有它 shell 会开在 host 进程的目录。
+- 从面板点「启动」时，工作目录随请求带上——路由里看不到 agent 作用域，没有它 shell 会开在 host 进程的目录。
 - 卸载插件会结束全部 shell 并断开所有镜像。
 - 想要 SSH：直接在面板里敲 `ssh 用户@主机` 即可；它就是终端，不需要额外适配。
+- 拖宽面板会触发重排：客户端对尺寸变化去抖、Host 端把一次拖动合并成一次 PTY 几何变更，结果切分又锚定在命令回显行上，所以重排不会污染 `live_terminal_run` 的返回值。
 
 ## License
 

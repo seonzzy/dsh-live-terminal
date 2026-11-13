@@ -11,10 +11,10 @@
  * Host and page run the same emulator (`@xterm/headless` on the host side), so
  * the screen the model reads is the screen you see.
  *
- * Better Sidebar is an OPTIONAL dependency: the plugin registers a tab when
- * `ctx.betterSidebar` exists, and otherwise falls back to its own sidebar entry
- * plus main panel, so a profile without that plugin still gets a usable
- * terminal.
+ * Better Sidebar is NOT involved. The panel is a tab of DSH's own right sidebar
+ * (`sidebarRightTabs` + `sidebar.right.pane.tab`), so one registration serves
+ * every profile: installed alongside Better Sidebar or without it, the entry is
+ * the same one and appears exactly once.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-live-terminal',
@@ -24,8 +24,9 @@ window.__ModuleLoader__.load({
 
     /** Locale namespace owned by this plugin. */
     const NS = 'liveTerminal';
-    /** Tab type registered with Better Sidebar. */
-    const TAB_ID = 'live-terminal';
+    /** Tab type registered with DSH's own right sidebar. */
+    const DSH_TAB_ID = 'dsh-live-terminal';
+    const DSH_TAB_KIND = 'dsh-live-terminal';
     /** Package name, and the Loader-row id the settings page keys this plugin by. */
     const PLUGIN_PACKAGE = 'dsh-live-terminal';
     /* The settings namespace is the Loader ROW's own id — `entry.options.id` in
@@ -34,8 +35,6 @@ window.__ModuleLoader__.load({
      * include wrapper in the plugin list, and asking the form controller for it
      * yields no namespace at all. */
     const ROW_ID = 'live-terminal';
-    /** Panel id of the own-surface fallback (no Better Sidebar). */
-    const PANEL_ID = 'live-terminal';
     /** Host routes registered by the Host half. */
     const CONTROL = '/live-terminal';
     const STREAM = '/live-terminal/stream';
@@ -573,38 +572,14 @@ window.__ModuleLoader__.load({
          * load order between the two plugins does not matter and disabling
          * Better Sidebar cannot leave a dangling tab registration behind.
          */
-        let sidebarService;
-        ctx.inject(['betterSidebar'], (sctx) => {
-          const sidebar = sctx.get('betterSidebar');
-          if (sidebar === undefined || typeof sidebar.registerTab !== 'function') return;
-          sidebarService = sidebar;
-          sctx.effect(
-            () =>
-              sidebar.registerTab({
-                id: TAB_ID,
-                title: () => t('panel'),
-                description: () => t('tabDesc'),
-                icon: (size) => h(TerminalIcon, { size }),
-                order: 60,
-                single: true,
-                component: ({ scope }) =>
-                  /* Keyed by conversation: a tab belongs to one session, and the
-                   * key also remounts the emulator when that session changes.
-                   * `scope.cwd` is the conversation's directory — the host needs
-                   * it because a route-started shell has no agent scope. */
-                  h(TerminalPane, {
-                    key: scope.sessionId,
-                    t,
-                    sessionId: scope.sessionId,
-                    cwd: scope.cwd,
-                  }),
-              }),
-            'live-terminal: better-sidebar tab',
-          );
-          return () => {
-            sidebarService = undefined;
-          };
-        });
+        /* Exactly one surface owns the sidebar entry. These flags decide which,
+         * and both live at apply scope so either inject can win regardless of
+         * which service resolves first. */
+        /** DSH's own right-sidebar faces: the type registry, and the controller that opens one. */
+        let dshTabRegistry;
+        let dshRightController;
+        let dshMounted = false;
+        const disposers = [];
 
         /**
          * The Host's "open the panel" signal.
@@ -655,19 +630,27 @@ window.__ModuleLoader__.load({
                 return;
               }
               if (frame?.type !== 'open') return;
-              const sidebar = sidebarService;
-              /* Nothing to open without the sidebar; the screen is kept for later. */
-              if (sidebar === undefined || typeof sidebar.openTab !== 'function') return;
-              if (sidebar.isTabEnabled?.(TAB_ID) === false) return;
+              /* One surface, and it is DSH's own right sidebar — the entry that
+               * exists whether or not Better Sidebar is installed. This is the
+               * only registration the plugin makes, so the panel can never be
+               * duplicated and can never disappear with a third-party plugin.
+               *
+               * `openTabIn` rather than `openTab`: the latter takes the session
+               * currently adopted to the column, which is nobody while the
+               * column is hidden, so it silently does nothing — the one case
+               * this signal exists for. */
+              const dshRight = dshRightController;
               /* No "already active" guard here: the Host only signals when NO
                * page is subscribed to this conversation's stream, which means
                * the tab component is not mounted — nothing is visible and there
-               * is no focus to steal. A store record can stay "active" while
-               * the sidebar is collapsed, and skipping on that would leave the
-               * panel shut, which is the one case this signal exists to fix. */
+               * is no focus to steal. */
               try {
-                sidebar.openTab({ type: TAB_ID }, { sessionId: frame.session });
-                trace(`open requested for ${frame.session}`);
+                if (dshRight !== undefined && typeof dshRight.openTabIn === 'function') {
+                  dshRight.openTabIn(frame.session, DSH_TAB_KIND, { replaceTab: true });
+                  trace(`open requested for ${frame.session} (dsh-sidebar)`);
+                } else {
+                  trace(`no sidebar surface for ${frame.session}`);
+                }
               } catch (failure) {
                 trace(`open failed: ${String(failure?.message ?? failure)}`);
               }
@@ -832,30 +815,124 @@ window.__ModuleLoader__.load({
           'live-terminal: plugin detail',
         );
 
-        /* Fallback surface for a profile without Better Sidebar: an own sidebar
-         * entry plus the main panel it opens. Registering both is harmless —
-         * the tab and the panel address the same per-conversation terminal. */
-        ctx.effect(
-          () =>
-            ctx.slots.inject('main', () =>
-              ctx.slots.register(
-                { name: 'main', key: PANEL_ID, locale: NS },
-                ({ scope }) =>
-                  h(TerminalPane, { t, sessionId: scope?.sessionId ?? '', cwd: scope?.cwd }),
-              ),
+        /* ------------------------------------------------------------------
+         * The panel's only home: DSH's own right sidebar.
+         *
+         * This is the surface the host itself provides, so it is the one entry
+         * that exists in every profile — with Better Sidebar installed, without
+         * it, and after it is uninstalled. Registering anywhere else as well put
+         * the same panel in the sidebar twice; registering only there keeps one
+         * entry that never depends on a third-party plugin.
+         *
+         * Three pieces are needed — a tab type nobody can dispatch renders
+         * nothing, and a body slot with no type is never opened:
+         *
+         *   sidebarRightTabs.register(...)   declares the kind and its title
+         *   sidebar.right.pane.tab          renders the body for that kind
+         *   sidebar.right.pane.tab.title    renders the live tab chip
+         * ------------------------------------------------------------------ */
+        /**
+         * Register on DSH's own right sidebar: type, body and title.
+         *
+         * All three are needed — a tab type nobody can dispatch renders nothing,
+         * and a body slot with no type is never opened. The body is dispatched by
+         * `entryKey: definition.id` and receives the conversation id through
+         * `inject(sessionId)`, so no scope guessing (which is what left the old
+         * left-sidebar entry bound to an empty session key).
+         */
+        const mountDsh = (sctx) => {
+          if (dshMounted) return;
+          const tabs = sctx.get('sidebarRightTabs');
+          if (tabs === undefined || typeof tabs.register !== 'function') return;
+          dshMounted = true;
+          dshTabRegistry = tabs;
+          disposers.push(
+            sctx.effect(
+              () =>
+                tabs.register({
+                  id: DSH_TAB_ID,
+                  kind: DSH_TAB_KIND,
+                  priority: 'builtin',
+                  multiple: false,
+                  /* Keep the emulator alive while the tab is not the active one:
+                   * the model may be typing into it, and remounting would replay
+                   * the whole screen for nothing. */
+                  keepMounted: true,
+                  title: () => t('panel'),
+                  guide: [
+                    {
+                      id: 'open-live-terminal',
+                      order: 21,
+                      title: () => t('panel'),
+                      description: () => t('tabDesc'),
+                      icon: (size) => h(TerminalIcon, { size }),
+                    },
+                  ],
+                }),
+              'live-terminal: dsh tab type',
             ),
-          'live-terminal: panel',
-        );
-        ctx.effect(
-          () =>
-            ctx.slots.inject('sidebar.panellist', () =>
-              ctx.slots.register(
-                { name: 'sidebar.panellist', id: PANEL_ID, order: 6, label: () => t('panel'), locale: NS },
-                TerminalIcon,
-              ),
+          );
+          const bodyScope = ctx;
+          disposers.push(
+            bodyScope.effect(
+              () =>
+                bodyScope.slots.inject('sidebar.right.pane.tab', () =>
+                  bodyScope.slots.register(
+                    {
+                      name: 'sidebar.right.pane.tab',
+                      key: DSH_TAB_ID,
+                      locale: NS,
+                      inject: (sessionId) => ({ sessionId }),
+                    },
+                    ({ sessionId }) =>
+                      h(TerminalPane, { key: sessionId, t, sessionId: sessionId ?? '' }),
+                  ),
+                ),
+              'live-terminal: dsh tab body',
             ),
-          'live-terminal: entry',
-        );
+          );
+          disposers.push(
+            bodyScope.effect(
+              () =>
+                bodyScope.slots.inject('sidebar.right.pane.tab.title', () =>
+                  bodyScope.slots.register(
+                    { name: 'sidebar.right.pane.tab.title', key: DSH_TAB_ID, locale: NS },
+                    () => h('span', { className: 'lvt-tabtitle' }, t('panel')),
+                  ),
+                ),
+              'live-terminal: dsh tab title',
+            ),
+          );
+        };
+
+        const unmountDsh = () => {
+          dshMounted = false;
+          dshTabRegistry = undefined;
+          for (const dispose of disposers.splice(0)) {
+            try {
+              dispose();
+            } catch {
+              /* already gone */
+            }
+          }
+        };
+
+        /* The one registration this plugin makes. It follows `sidebarRightTabs`,
+         * which DSH provides itself — so the entry is there with or without
+         * Better Sidebar, and nothing here depends on a third-party plugin. */
+        ctx.inject(['sidebarRightTabs'], (sctx) => {
+          mountDsh(sctx);
+          return () => unmountDsh();
+        });
+
+        ctx.inject(['sidebarRight'], (sctx) => {
+          const right = sctx.get('sidebarRight');
+          if (right === undefined || typeof right.openTabIn !== 'function') return;
+          dshRightController = right;
+          return () => {
+            dshRightController = undefined;
+          };
+        });
       },
       inject: ['slots', 'locale'],
     };
