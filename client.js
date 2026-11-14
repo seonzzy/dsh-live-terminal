@@ -61,12 +61,14 @@ window.__ModuleLoader__.load({
       restart: '重新启动',
       stop: '关闭',
       clear: '清屏',
+      focus: '专注模式',
+      exitFocus: '退出专注',
       inputHint: '点一下屏幕即可直接输入；也可以让模型执行。',
-      empty: '还没有输出。点「启动」开一条终端，或让模型调用 live_terminal_open。',
+      empty: '正在启动终端…',
       noHost: 'Host 半侧没响应：插件可能只装了一半，或路由被占用。',
       noXterm: '没能加载终端模拟器（vendor/xterm.js）：插件可能没装全。',
       lastNote: '模型动作',
-      notRunning: '终端没在运行，先点「启动」。',
+      notRunning: '终端没在运行。',
       detailTitle: '实时终端',
       detailBody: '每个对话在右侧栏有一条独立终端；模型用 live_terminal_* 工具在里面执行，你在同一块屏幕上看着它敲、它出，也能直接自己敲。',
       autoOpenLabel: '自动打开右侧栏',
@@ -96,12 +98,14 @@ window.__ModuleLoader__.load({
       restart: 'Restart',
       stop: 'Close',
       clear: 'Clear',
+      focus: 'Focus',
+      exitFocus: 'Exit focus',
       inputHint: 'Click the screen and type; the model can run commands too.',
-      empty: 'No output yet. Start a terminal here, or let the model call live_terminal_open.',
+      empty: 'Starting the terminal…',
       noHost: 'The Host half did not answer: the plugin may be half-installed or its routes are taken.',
       noXterm: 'The terminal emulator (vendor/xterm.js) did not load: the plugin may be incomplete.',
       lastNote: 'Model action',
-      notRunning: 'The terminal is not running — press Start.',
+      notRunning: 'The terminal is not running.',
       detailTitle: 'Live terminal',
       detailBody: 'One terminal per conversation in the right sidebar; the model drives it with the live_terminal_* tools, you watch the same screen and can type into it yourself.',
       autoOpenLabel: 'Open the right sidebar automatically',
@@ -129,9 +133,30 @@ window.__ModuleLoader__.load({
 .lvt-btn:disabled{opacity:.5;cursor:default}
 .lvt-btn[data-tone="primary"]{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}
 .lvt-btn[data-tone="danger"]{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
-.lvt-screen{flex:1 1 auto;min-height:160px;position:relative;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--dsw-alias-bg-base);overflow:hidden}
-.lvt-term{position:absolute;inset:6px 8px;box-sizing:border-box}
+/* Every layer in the stack carries the SAME concrete colour the emulator paints
+ * with. The theme token cannot be used here: the bg-base alias resolves to
+ * nothing inside this shadowed slot, so var(...) fell back to a translucent
+ * value while xterm itself painted an opaque one — which is exactly the seam
+ * that showed as a darker band under the transcript. The --lvt-bg variable is
+ * set from the emulator's own theme at mount, so the two cannot drift apart. */
+.lvt-screen{flex:1 1 auto;min-height:160px;position:relative;display:flex;flex-direction:column;border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;background:var(--lvt-bg,#1b1b1f);overflow:hidden}
+.lvt-screen .lvt-term,.lvt-screen .xterm,.lvt-screen .xterm-screen,.lvt-screen .xterm-viewport{background:var(--lvt-bg,#1b1b1f)}
+/* Focus mode lifts the terminal out of the narrow column. Fixed positioning keeps
+ * the surrounding layout untouched. The inset is small on purpose: the point of
+ * this mode is to use the room, so a wide margin would waste the columns it was
+ * opened for. */
+.lvt-screen.lvt-focus{position:fixed;inset:12px;z-index:2147483000;min-height:0;border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.55)}
+.lvt-screen.lvt-focus::before{content:'';position:fixed;inset:0;z-index:-1;background:rgba(0,0,0,.45)}
+/* In flow, not absolutely positioned: FitAddon sizes itself from the parent's
+ * computed width/height, and an absolutely positioned box without an explicit
+ * size reports the wrong one before layout settles — the symptom is a grid that
+ * fills only the top strip of the pane and leaves the rest empty. A flex child
+ * with min-height:0 tracks the column exactly, at any pane size. */
+.lvt-term{position:relative;flex:1 1 auto;min-height:0;margin:6px 8px;box-sizing:border-box;overflow:hidden}
+.lvt-screen.lvt-focus .lvt-term{margin:8px}
 .lvt-term .xterm{height:100%}
+.lvt-term .xterm-viewport{overflow-y:auto !important}
+.lvt-term canvas{background:var(--lvt-bg,#1b1b1f)}
 .lvt-empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:18px;text-align:center;font-size:12px;color:var(--dsw-alias-label-secondary);pointer-events:none}
 .lvt-note{font-size:10.5px;color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:0 0 auto}
 .lvt-error{font-size:11.5px;color:var(--dsw-alias-state-error-primary);flex:0 0 auto}
@@ -268,6 +293,15 @@ window.__ModuleLoader__.load({
       const [hasOutput, setHasOutput] = React.useState(false);
       const [missing, setMissing] = React.useState(false);
       const [geometry, setGeometry] = React.useState(null);
+      /** Widen the terminal past the sidebar, for output the column is too narrow to read. */
+      const [focused, setFocused] = React.useState(false);
+      /** Re-fits the emulator; set by the mount effect once the instance exists. */
+      const fitRef = React.useRef(null);
+      /** True while the overlay is open, so its size change is not sent to the PTY. */
+      const focusRef = React.useRef(false);
+      focusRef.current = focused;
+      /** Suppresses the next resize report, which belongs to a focus toggle. */
+      const skipResizeRef = React.useRef(false);
       const host = React.useRef(null);
       const term = React.useRef(null);
       const stateRef = React.useRef('idle');
@@ -286,6 +320,8 @@ window.__ModuleLoader__.load({
         let disposed = false;
         let resizeObserver;
         let resizeSend;
+        /** Detaches the pointer correction; set by the mount effect. */
+        let detachPointer;
         let detachData;
         void (async () => {
           try {
@@ -310,13 +346,35 @@ window.__ModuleLoader__.load({
             rows: 24,
             scrollback: 5000,
             cursorBlink: true,
-            fontFamily: 'ui-monospace, SFMono-Regular, Consolas, "Cascadia Mono", monospace',
+            /* Consolas resolves everywhere on Windows and is真 monospace; the
+             * generic stack can fall back to a proportional face, and xterm
+             * measures ONE character and multiplies, so a fallback would put
+             * every glyph at the wrong x. */
+            fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace',
             fontSize: 12,
+            /* Compact rows: the pane is tall and narrow, so a tighter line height
+             * fits noticeably more of the transcript. It must stay an integer
+             * pixel count after the host's zoom multiplies it, or the row index a
+             * pointer maps to drifts by a row further down the screen. */
             lineHeight: 1.2,
+            letterSpacing: 0,
             theme: theme(),
             allowProposedApi: true,
           });
           term.current = instance;
+          /* Publish the emulator's own background as a CSS variable so every
+           * wrapper paints the identical colour. Reading it from the theme
+           * instead of re-reading the design token is deliberate: the token does
+           * not resolve in this slot, and a mismatch here is visible as a seam. */
+          const themeBackground = theme().background;
+          const screenBox = host.current?.parentElement;
+          if (screenBox) {
+            screenBox.style.setProperty('--lvt-bg', themeBackground);
+            /* Inline as well as the variable: a CSS rule from the host could
+             * still win over ours, and one opaque colour on the box is what
+             * removes the band regardless of rule order. */
+            screenBox.style.backgroundColor = themeBackground;
+          }
           instance.open(host.current);
           const fitAddon = typeof window.FitAddon?.FitAddon === 'function' ? new window.FitAddon.FitAddon() : undefined;
           if (fitAddon !== undefined) instance.loadAddon(fitAddon);
@@ -329,6 +387,44 @@ window.__ModuleLoader__.load({
             }
           };
           measure();
+
+          /* --------------------------------------------------------------
+           * An ancestor's CSS `zoom` is left entirely alone.
+           *
+           * Earlier attempts compensated for the host's UI scale here — dividing
+           * pointer coordinates, multiplying the row count — and every one of
+           * them made things worse: the row count is derived by `fit()` from the
+           * box it actually occupies, so overriding it pushed the grid past the
+           * viewport and cost the scrollbar. Under CSS `zoom` the emulator's
+           * measurements and the painted geometry scale together, which is
+           * self-consistent; the only thing that needed correcting was which
+           * pixel space a pointer is reported in, and that is handled at the
+           * event level below.
+           * -------------------------------------------------------------- */
+          const zoomFactor = () => {
+            const box = host.current;
+            if (box === null) return 1;
+            const layout = box.offsetWidth;
+            const painted = box.getBoundingClientRect().width;
+            if (!(layout > 0) || !(painted > 0)) return 1;
+            const ratio = painted / layout;
+            return Number.isFinite(ratio) && ratio > 1.001 ? ratio : 1;
+          };
+          const refit = () => {
+            measure();
+            /* `fit()` resizes the buffer but does not always repaint the rows it
+             * grew into — the grid then reports 61 rows while the DOM has only
+             * the handful that were visible before, and the rest of the pane
+             * stays blank. A full refresh of the addressable range is what makes
+             * the painted rows catch up with the buffer. */
+            try {
+              instance.refresh(0, Math.max(0, instance.rows - 1));
+            } catch {
+              /* the emulator is mid-teardown */
+            }
+          };
+          fitRef.current = refit;
+          refit();
           /* Every keystroke, paste and escape sequence goes to the PTY untouched. */
           detachData = instance.onData((data) => {
             if (stateRef.current !== 'running') return;
@@ -338,10 +434,22 @@ window.__ModuleLoader__.load({
             /* Fit immediately so the viewport tracks the drag, but send the new
              * geometry to the Host only when the gesture settles: every resize
              * the PTY receives makes the shell repaint at the new width, and a
-             * repaint landing mid-output is what smears the screen. */
+             * repaint landing mid-output is what smears the screen.
+             *
+             * A focus-mode toggle also changes this element's size, and those
+             * changes must NOT reach the PTY: the shell would reflow its whole
+             * transcript for a width that only exists while the overlay is open.
+             * `focusRef` is what tells the two apart. */
             resizeObserver = new ResizeObserver(() => {
-              measure();
+              refit();
               if (stateRef.current !== 'running') return;
+              /* A focus toggle resizes this element twice (open and close); the
+               * PTY must not hear about either, or the shell reflows a transcript
+               * that can never be put back. */
+              if (focusRef.current || skipResizeRef.current) {
+                skipResizeRef.current = false;
+                return;
+              }
               clearTimeout(resizeSend);
               resizeSend = setTimeout(() => {
                 void control(sessionId, { action: 'resize', cols: instance.cols, rows: instance.rows }).catch(() => undefined);
@@ -349,6 +457,54 @@ window.__ModuleLoader__.load({
             });
             resizeObserver.observe(host.current);
           }
+
+          /* --------------------------------------------------------------
+           * Pointer mapping under an ancestor's CSS `zoom`.
+           *
+           * The scale plugin sets `zoom` on a container above this terminal.
+           * Under CSS zoom the pointer arrives in PAINTED pixels while xterm
+           * divides the offset by a cell size measured in LAYOUT pixels, so a
+           * click lands a row or two below the cursor.
+           *
+           * `getComputedStyle(node).zoom` on the terminal itself always reports
+           * 1 — CSS zoom does not inherit into computed style — so the factor is
+           * measured instead, as the painted/layout width ratio of this box.
+           * Only the event coordinates are rewritten; nothing is written to the
+           * DOM, so no other pane's zoom is disturbed.
+           * -------------------------------------------------------------- */
+          let pointerScale = zoomFactor();
+          const correctPointer = (event) => {
+            if (pointerScale === 1) return;
+            const rect = host.current?.getBoundingClientRect();
+            if (!rect) return;
+            const x = rect.left + (event.clientX - rect.left) / pointerScale;
+            const y = rect.top + (event.clientY - rect.top) / pointerScale;
+            for (const [key, value] of [
+              ['clientX', x],
+              ['clientY', y],
+            ]) {
+              try {
+                Object.defineProperty(event, key, { value, configurable: true });
+              } catch {
+                /* non-configurable on this event: leave it rather than throw */
+              }
+            }
+          };
+          const pointerEvents = ['mousedown', 'mouseup', 'mousemove', 'click', 'dblclick', 'contextmenu'];
+          for (const name of pointerEvents) host.current?.addEventListener(name, correctPointer, true);
+          let pointerTimer;
+          const schedulePointerScale = () => {
+            clearTimeout(pointerTimer);
+            pointerTimer = setTimeout(() => {
+              pointerScale = zoomFactor();
+            }, 150);
+          };
+          window.addEventListener('resize', schedulePointerScale);
+          detachPointer = () => {
+            clearTimeout(pointerTimer);
+            for (const name of pointerEvents) host.current?.removeEventListener(name, correctPointer, true);
+            window.removeEventListener('resize', schedulePointerScale);
+          };
           /* Replay whatever the stream delivered while this was loading. */
           const queued = pending.current.splice(0);
           for (const apply of queued) apply(instance);
@@ -357,6 +513,8 @@ window.__ModuleLoader__.load({
           disposed = true;
           clearTimeout(resizeSend);
           resizeObserver?.disconnect();
+          detachPointer?.();
+          detachPointer = undefined;
           detachData?.dispose();
           term.current?.dispose();
           term.current = null;
@@ -453,24 +611,116 @@ window.__ModuleLoader__.load({
               ? t('stateFailed')
               : t('stateIdle');
 
-      const start = () => {
-        const instance = term.current;
-        const cols = instance?.cols ?? 100;
-        const rows = instance?.rows ?? 24;
-        void act({ action: 'start', cols, rows, cwd, restart: snapshot.state !== 'idle' }).then((payload) => {
-          if (payload !== undefined) {
-            setHasOutput(false);
-            term.current?.reset();
-          }
-        });
-      };
-
       /* Clicking the viewport focuses the emulator's hidden textarea, which is
        * what actually receives keystrokes; without this a click lands on the
        * container and typing goes nowhere. */
       const focusTerminal = () => {
         term.current?.focus();
       };
+
+      /* No Start button: opening the panel IS the intent to have a terminal, so
+       * an idle pane spawns one. Only `idle` does — a running, exited or failed
+       * session is left alone, so a remount cannot kill the model's shell. */
+      const startRef = React.useRef(null);
+      startRef.current = () => {
+        const instance = term.current;
+        void act({
+          action: 'start',
+          cols: instance?.cols ?? 100,
+          rows: instance?.rows ?? 24,
+          cwd,
+          restart: snapshot.state !== 'idle',
+        }).then((payload) => {
+          if (payload !== undefined) {
+            setHasOutput(false);
+            term.current?.reset();
+          }
+        });
+      };
+      React.useEffect(() => {
+        if (sessionId === '' || missing || snapshot.state !== 'idle') return;
+        startRef.current?.();
+        /* Keyed on the idle state alone: this is an entry action, not a reaction
+         * to every snapshot. */
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [sessionId, missing, snapshot.state === 'idle']);
+
+      /* Closing the panel closes its terminal, which is what closing a terminal
+       * window means. Closing a tab without closing the panel only detaches a
+       * viewer, and the auto-open signal can bring that back with the screen. */
+      React.useEffect(
+        () => () => {
+          if (sessionId === '') return;
+          void control(sessionId, { action: 'stop' }).catch(() => undefined);
+        },
+        [sessionId],
+      );
+
+      /* Focus mode is PURELY VISUAL and must not touch the emulator's grid.
+       *
+       * Changing `options.fontSize` looks free but is not: xterm re-measures the
+       * font, rebuilds every row element and repaints the whole viewport, which
+       * is the stutter on entering and leaving. A CSS transform is composited by
+       * the browser instead — no re-measure, no reflow of the character grid, no
+       * message to the PTY — so the switch costs one frame.
+       *
+       * The transform origin is the top-left so the visible text does not shift,
+       * and the overlay already has the room for it. */
+      /* Focus mode is PURELY VISUAL: one font size, one geometry, for the whole
+       * session. Changing the type size does make xterm re-measure and repaint
+       * the visible viewport, which is the cost of a switch — but it is bounded
+       * by the viewport, not by scrollback, and it is far cheaper than the
+       * alternative of letting the PTY reflow the transcript (which cannot be
+       * undone once the shell has emitted its wrapping).
+       *
+       * `will-change` is set just before the change so the browser promotes the
+       * layer ahead of the repaint instead of during it. */
+      React.useEffect(() => {
+        const instance = term.current;
+        if (instance === null) return;
+        const box = instance.element;
+        /* Both directions of the toggle resize the element; neither belongs to
+         * the shell. Set before the change so the observer sees it too. */
+        skipResizeRef.current = true;
+        box?.style.setProperty('will-change', 'scroll-position');
+
+        /* The class change and the font change are not enough on their own: the
+         * overlay's `position: fixed` box is only laid out after the browser's
+         * next style pass, so a `fit()` inside the same frame measures the OLD
+         * size and the grid keeps the narrow column's rows — which is the large
+         * empty area under the prompt. Fitting across several frames, and again
+         * when the resize observer has fired, converges on the real box. */
+        const timers = [];
+        const applyFont = () => {
+          try {
+            instance.options.fontSize = focused ? 15 : 12;
+          } catch {
+            /* frozen options: nothing to scale */
+          }
+        };
+        applyFont();
+        for (const delay of [0, 16, 60, 160, 320]) {
+          timers.push(setTimeout(() => fitRef.current?.(), delay));
+        }
+        const settle = setTimeout(() => {
+          box?.style.removeProperty('will-change');
+        }, 360);
+        timers.push(settle);
+        return () => {
+          for (const timer of timers) clearTimeout(timer);
+        };
+      }, [focused]);
+
+      /* Esc leaves focus mode unless the terminal's program wants the key (vim,
+       * less, ssh) — in that case xterm already consumed it. */
+      React.useEffect(() => {
+        if (!focused) return;
+        const onKey = (event) => {
+          if (event.key === 'Escape') setFocused(false);
+        };
+        window.addEventListener('keydown', onKey, true);
+        return () => window.removeEventListener('keydown', onKey, true);
+      }, [focused]);
 
       return h(
         'div',
@@ -493,11 +743,6 @@ window.__ModuleLoader__.load({
           h(
             'span',
             { style: { display: 'flex', gap: '6px', marginLeft: 'auto' }, key: 'actions' },
-            h(
-              'button',
-              { type: 'button', className: 'lvt-btn', 'data-tone': 'primary', disabled: busy || missing, onClick: start },
-              running ? t('restart') : t('start'),
-            ),
             h(
               'button',
               {
@@ -529,16 +774,11 @@ window.__ModuleLoader__.load({
               {
                 type: 'button',
                 className: 'lvt-btn',
-                'data-tone': 'danger',
-                disabled: busy || snapshot.state === 'idle',
-                onClick: () => {
-                  void act({ action: 'stop' }).then(() => {
-                    term.current?.reset();
-                    setHasOutput(false);
-                  });
-                },
+                title: focused ? t('exitFocus') : t('focus'),
+                'aria-pressed': focused,
+                onClick: () => setFocused((value) => !value),
               },
-              t('stop'),
+              focused ? t('exitFocus') : t('focus'),
             ),
           ),
         ),
@@ -550,7 +790,7 @@ window.__ModuleLoader__.load({
             : null,
         h(
           'div',
-          { className: 'lvt-screen', onMouseDown: focusTerminal },
+          { className: focused ? 'lvt-screen lvt-focus' : 'lvt-screen', onMouseDown: focusTerminal },
           h('div', { className: 'lvt-term', ref: host }),
           error === 'host' || missing || hasOutput || snapshot.state !== 'idle'
             ? null

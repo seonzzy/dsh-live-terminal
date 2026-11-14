@@ -942,7 +942,7 @@ function controlHandler(pool, ctx, diagnostics, trace) {
       if (action === 'trace') {
         /* Page-side self-report, read through ?diag=1. A failing EventSource on
          * the page is otherwise invisible: the server sees no request at all. */
-        trace.push({ at: Date.now(), tag: String(body.tag ?? ''), detail: String(body.detail ?? '').slice(0, 160) });
+        trace.push({ at: Date.now(), tag: String(body.tag ?? ''), detail: String(body.detail ?? '').slice(0, 1200) });
         if (trace.length > 12) trace.splice(0, trace.length - 12);
         send(200, { ok: true });
         return;
