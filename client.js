@@ -127,7 +127,7 @@ window.__ModuleLoader__.load({
 .lvt-dot[data-state="running"]{background:var(--dsw-alias-state-success-primary)}
 .lvt-dot[data-state="exited"]{background:var(--dsw-alias-state-warn-primary)}
 .lvt-dot[data-state="failed"]{background:var(--dsw-alias-state-error-primary)}
-.lvt-meta{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:26ch}
+.lvt-btn.lvt-icon{display:inline-flex;align-items:center;justify-content:center;padding:4px 5px;line-height:0}
 .lvt-btn{appearance:none;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font:inherit;font-size:11.5px;line-height:1;padding:4px 8px;border-radius:5px;cursor:pointer}
 .lvt-btn:hover{background:var(--dsw-alias-bg-layer-2)}
 .lvt-btn:disabled{opacity:.5;cursor:default}
@@ -254,6 +254,26 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /** A 16×16 stroke glyph for the toolbar's icon buttons. */
+    function Glyph({ children }) {
+      return h(
+        'svg',
+        {
+          width: 14,
+          height: 14,
+          viewBox: '0 0 16 16',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 1.3,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          'aria-hidden': 'true',
+          style: { display: 'block' },
+        },
+        children,
+      );
+    }
+
     /** Read a theme token, falling back to a literal so a missing token cannot blank the screen. */
     function token(name, fallback) {
       const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -300,8 +320,11 @@ window.__ModuleLoader__.load({
       /** True while the overlay is open, so its size change is not sent to the PTY. */
       const focusRef = React.useRef(false);
       focusRef.current = focused;
-      /** Suppresses the next resize report, which belongs to a focus toggle. */
-      const skipResizeRef = React.useRef(false);
+      /** Deadline for suppressing resize reports: every geometry change a focus
+       * toggle causes belongs to the toggle, not to the window, and none of them
+       * may reach the PTY. A deadline rather than a one-shot flag because one
+       * toggle can surface more than one resize notification. */
+      const skipSendUntilRef = React.useRef(0);
       const host = React.useRef(null);
       const term = React.useRef(null);
       const stateRef = React.useRef('idle');
@@ -328,6 +351,9 @@ window.__ModuleLoader__.load({
             await loadStylesheet();
             await loadScript(`${VENDOR}/xterm.js`);
             await loadScript(`${VENDOR}/addon-fit.js`);
+            /* Optional: the renderer addon. A missing or unrunnable file must
+             * not take the panel down — the DOM renderer is always there. */
+            await loadScript(`${VENDOR}/addon-webgl.js`).catch(() => undefined);
           } catch (failure) {
             if (!disposed) {
               setMissing(true);
@@ -378,15 +404,6 @@ window.__ModuleLoader__.load({
           instance.open(host.current);
           const fitAddon = typeof window.FitAddon?.FitAddon === 'function' ? new window.FitAddon.FitAddon() : undefined;
           if (fitAddon !== undefined) instance.loadAddon(fitAddon);
-          const measure = () => {
-            if (fitAddon === undefined) return;
-            try {
-              fitAddon.fit();
-            } catch {
-              /* the element is not laid out yet */
-            }
-          };
-          measure();
 
           /* --------------------------------------------------------------
            * An ancestor's CSS `zoom` is left entirely alone.
@@ -410,13 +427,56 @@ window.__ModuleLoader__.load({
             const ratio = painted / layout;
             return Number.isFinite(ratio) && ratio > 1.001 ? ratio : 1;
           };
-          const refit = () => {
-            measure();
-            /* `fit()` resizes the buffer but does not always repaint the rows it
-             * grew into — the grid then reports 61 rows while the DOM has only
-             * the handful that were visible before, and the rest of the pane
-             * stays blank. A full refresh of the addressable range is what makes
-             * the painted rows catch up with the buffer. */
+          /* WebGL renderer. The default DOM renderer rebuilds every row element
+           * on each repaint and that cost tracks the output volume — the other
+           * half of the stutter this panel is known for. On xterm 6 the canvas
+           * addon is gone; addon-webgl is the renderer release paired with this
+           * vendored core. Two cases keep the DOM renderer instead: an
+           * ancestor's CSS zoom (above), where a canvas backing store cannot
+           * track the painted scale and the glyphs would blur, and any
+           * environment without a usable WebGL context. */
+          if (zoomFactor() === 1) {
+            try {
+              const WebglCtor = window.WebglAddon?.WebglAddon;
+              if (typeof WebglCtor === 'function') instance.loadAddon(new WebglCtor());
+            } catch {
+              /* no WebGL here: the DOM renderer stays */
+            }
+          }
+          /* Fit only when the computed grid differs from the current one.
+           *
+           * Every `resize` that changes the column count re-wraps the whole
+           * scrollback, and every `refresh` rebuilds the viewport's DOM — so a
+           * fit that changes nothing must do neither. The old code refreshed on
+           * every call, and a focus toggle made six of those calls in one
+           * switch; with a long transcript that was the stutter.
+           *
+           * `fit()` also resizes the buffer without always repainting the rows
+           * it grew into — the grid then reports 61 rows while the DOM has only
+           * the handful that were visible before, and the rest of the pane
+           * stays blank — so a real resize still ends with a full refresh of
+           * the addressable range. `force` repaints even when the geometry is
+           * unchanged, for the passes whose whole job is to catch a stale grid
+           * up with the buffer. */
+          const refit = (options) => {
+            if (fitAddon === undefined) return;
+            const force = options?.force === true;
+            let resized = false;
+            try {
+              const proposal = fitAddon.proposeDimensions();
+              if (
+                proposal !== undefined &&
+                !isNaN(proposal.cols) &&
+                !isNaN(proposal.rows) &&
+                (proposal.cols !== instance.cols || proposal.rows !== instance.rows)
+              ) {
+                fitAddon.fit();
+                resized = true;
+              }
+            } catch {
+              /* the element is not laid out yet */
+            }
+            if (!resized && !force) return;
             try {
               instance.refresh(0, Math.max(0, instance.rows - 1));
             } catch {
@@ -424,7 +484,7 @@ window.__ModuleLoader__.load({
             }
           };
           fitRef.current = refit;
-          refit();
+          refit({ force: true });
           /* Every keystroke, paste and escape sequence goes to the PTY untouched. */
           detachData = instance.onData((data) => {
             if (stateRef.current !== 'running') return;
@@ -439,21 +499,18 @@ window.__ModuleLoader__.load({
              * A focus-mode toggle also changes this element's size, and those
              * changes must NOT reach the PTY: the shell would reflow its whole
              * transcript for a width that only exists while the overlay is open.
-             * `focusRef` is what tells the two apart. */
+             * `focusRef` and the `skipSendUntilRef` deadline tell the two apart. */
             resizeObserver = new ResizeObserver(() => {
               refit();
               if (stateRef.current !== 'running') return;
-              /* A focus toggle resizes this element twice (open and close); the
-               * PTY must not hear about either, or the shell reflows a transcript
-               * that can never be put back. */
-              if (focusRef.current || skipResizeRef.current) {
-                skipResizeRef.current = false;
-                return;
-              }
+              /* A focus toggle resizes this element (open and close); the
+               * PTY must not hear about any of it, or the shell reflows a
+               * transcript that can never be put back. */
+              if (focusRef.current || Date.now() < skipSendUntilRef.current) return;
               clearTimeout(resizeSend);
               resizeSend = setTimeout(() => {
                 void control(sessionId, { action: 'resize', cols: instance.cols, rows: instance.rows }).catch(() => undefined);
-              }, 150);
+              }, 250);
             });
             resizeObserver.observe(host.current);
           }
@@ -656,58 +713,62 @@ window.__ModuleLoader__.load({
         [sessionId],
       );
 
-      /* Focus mode is PURELY VISUAL and must not touch the emulator's grid.
+      /* Focus mode is PURELY VISUAL and must not touch the PTY's geometry.
        *
-       * Changing `options.fontSize` looks free but is not: xterm re-measures the
-       * font, rebuilds every row element and repaints the whole viewport, which
-       * is the stutter on entering and leaving. A CSS transform is composited by
-       * the browser instead — no re-measure, no reflow of the character grid, no
-       * message to the PTY — so the switch costs one frame.
+       * The switch is expensive by nature: the font change makes xterm
+       * re-measure and repaint the viewport, and the one real `resize` re-wraps
+       * the whole scrollback whenever the column count changes. The old code
+       * paid both costs several times over — a synchronous fit plus five timed
+       * fits, each an unconditional full repaint — which is the stutter on
+       * entering and leaving, and it grows with the transcript. The geometry is
+       * now settled once per toggle:
        *
-       * The transform origin is the top-left so the visible text does not shift,
-       * and the overlay already has the room for it. */
-      /* Focus mode is PURELY VISUAL: one font size, one geometry, for the whole
-       * session. Changing the type size does make xterm re-measure and repaint
-       * the visible viewport, which is the cost of a switch — but it is bounded
-       * by the viewport, not by scrollback, and it is far cheaper than the
-       * alternative of letting the PTY reflow the transcript (which cannot be
-       * undone once the shell has emitted its wrapping).
+       * - the font is applied in a LAYOUT effect, synchronously with the class
+       *   change, so the ResizeObserver's fit — which fires after layout —
+       *   computes with the NEW cell size and resizes to the right geometry the
+       *   first time (a stale-font fit would resize twice);
+       * - the follow-up fits are scheduled, never run in the change's own frame
+       *   (the fixed overlay is only laid out after the next style pass, so a
+       *   fit in the same frame measures the OLD box), and `refit` no-ops when
+       *   the geometry already matches;
+       * - one settle pass repaints with `force`, which is what catches a grid
+       *   that grew and kept stale rows.
        *
        * `will-change` is set just before the change so the browser promotes the
        * layer ahead of the repaint instead of during it. */
-      React.useEffect(() => {
+      React.useLayoutEffect(() => {
         const instance = term.current;
         if (instance === null) return;
         const box = instance.element;
-        /* Both directions of the toggle resize the element; neither belongs to
-         * the shell. Set before the change so the observer sees it too. */
-        skipResizeRef.current = true;
+        /* Both directions of the toggle resize the element; none of those
+         * changes belong to the shell. A deadline, not a one-shot flag: one
+         * toggle can surface more than one resize notification, and every one
+         * of them must be swallowed. */
+        skipSendUntilRef.current = Date.now() + 400;
         box?.style.setProperty('will-change', 'scroll-position');
-
-        /* The class change and the font change are not enough on their own: the
-         * overlay's `position: fixed` box is only laid out after the browser's
-         * next style pass, so a `fit()` inside the same frame measures the OLD
-         * size and the grid keeps the narrow column's rows — which is the large
-         * empty area under the prompt. Fitting across several frames, and again
-         * when the resize observer has fired, converges on the real box. */
-        const timers = [];
-        const applyFont = () => {
-          try {
-            instance.options.fontSize = focused ? 15 : 12;
-          } catch {
-            /* frozen options: nothing to scale */
-          }
-        };
-        applyFont();
-        for (const delay of [0, 16, 60, 160, 320]) {
-          timers.push(setTimeout(() => fitRef.current?.(), delay));
+        try {
+          instance.options.fontSize = focused ? 15 : 12;
+        } catch {
+          /* frozen options: nothing to scale */
         }
+
+        /* One fit after the next paint — the ResizeObserver usually gets there
+         * first and is the primary fit — and one settle pass. */
+        const cancels = [];
+        const outer = requestAnimationFrame(() => {
+          const inner = requestAnimationFrame(() => {
+            fitRef.current?.();
+          });
+          cancels.push(() => cancelAnimationFrame(inner));
+        });
+        cancels.push(() => cancelAnimationFrame(outer));
         const settle = setTimeout(() => {
+          fitRef.current?.({ force: true });
           box?.style.removeProperty('will-change');
-        }, 360);
-        timers.push(settle);
+        }, 320);
+        cancels.push(() => clearTimeout(settle));
         return () => {
-          for (const timer of timers) clearTimeout(timer);
+          for (const cancel of cancels) cancel();
         };
       }, [focused]);
 
@@ -731,54 +792,123 @@ window.__ModuleLoader__.load({
           { className: 'lvt-bar' },
           h(
             'span',
-            { className: 'lvt-pill', key: 'state' },
+            {
+              className: 'lvt-pill',
+              key: 'state',
+              /* shell and cwd left the bar's flow (they wrapped the toolbar in
+               * a narrow sidebar); the full paths live on the pill's tooltip. */
+              title: [snapshot.shell, snapshot.cwd].filter((value) => value !== undefined && value !== null).join(' · '),
+            },
             h('span', { className: 'lvt-dot', 'data-state': snapshot.state }),
             stateLabel,
           ),
           h('span', { key: 'mirror', title: t('streaming') }, connected ? '●' : '○'),
-          snapshot.shell !== undefined ? h('span', { className: 'lvt-meta', key: 'shell' }, snapshot.shell) : null,
-          snapshot.cwd !== null && snapshot.cwd !== undefined
-            ? h('span', { className: 'lvt-meta', key: 'cwd', title: snapshot.cwd }, snapshot.cwd)
-            : null,
           h(
             'span',
             { style: { display: 'flex', gap: '6px', marginLeft: 'auto' }, key: 'actions' },
+            running
+              ? h(
+                  'button',
+                  {
+                    type: 'button',
+                    className: 'lvt-btn lvt-icon',
+                    title: 'Ctrl-C',
+                    'aria-label': 'Ctrl-C',
+                    disabled: busy,
+                    onClick: () => {
+                      void act({ action: 'signal', signal: 'SIGINT' });
+                    },
+                  },
+                  h(Glyph, null, h('circle', { cx: 8, cy: 8, r: 5.6 }), h('path', { d: 'M4.2 11.8 11.8 4.2' })),
+                )
+              : snapshot.state === 'exited' || snapshot.state === 'failed'
+                ? /* A dead shell needs a way back; without this the panel is
+                   * stuck until the whole tab is re-created. */
+                  h(
+                    'button',
+                    {
+                      type: 'button',
+                      className: 'lvt-btn',
+                      disabled: busy,
+                      onClick: () => {
+                        startRef.current?.();
+                      },
+                    },
+                    t('restart'),
+                  )
+                : null,
             h(
               'button',
               {
                 type: 'button',
-                className: 'lvt-btn',
-                disabled: busy || !running,
-                onClick: () => {
-                  void act({ action: 'signal', signal: 'SIGINT' });
-                },
-              },
-              'Ctrl-C',
-            ),
-            h(
-              'button',
-              {
-                type: 'button',
-                className: 'lvt-btn',
+                className: 'lvt-btn lvt-icon',
+                title: t('clear'),
+                'aria-label': t('clear'),
                 disabled: busy,
                 onClick: () => {
-                  term.current?.clear();
-                  term.current?.reset();
-                  setHasOutput(false);
+                  const instance = term.current;
+                  if (!running) {
+                    /* Nothing is listening: trim the local transcript and
+                     * settle the emulator back to a neutral state. */
+                    instance?.clear();
+                    instance?.reset();
+                    setHasOutput(false);
+                    return;
+                  }
+                  /* The Host owns the decision: at a shell prompt it types the
+                   * shell's own clear command (`cls` / `Clear-Host` /
+                   * `clear`), and while a full-screen program or a half-typed
+                   * line owns the keyboard it wipes both screens instead of
+                   * typing into them. The page's transcript is trimmed either
+                   * way, since only the current screen is being cleared. */
+                  void act({ action: 'clear' }).then((payload) => {
+                    if (payload === undefined) return;
+                    instance?.clear();
+                    setHasOutput(false);
+                  });
                 },
               },
-              t('clear'),
+              h(
+                Glyph,
+                null,
+                h('rect', {
+                  x: 3.2,
+                  y: 6.6,
+                  width: 10,
+                  height: 4.6,
+                  rx: 1.6,
+                  transform: 'rotate(-35 8 8.9)',
+                }),
+                h('path', { d: 'M2.8 13.8h10.4' }),
+              ),
             ),
             h(
               'button',
               {
                 type: 'button',
-                className: 'lvt-btn',
+                className: 'lvt-btn lvt-icon',
                 title: focused ? t('exitFocus') : t('focus'),
+                'aria-label': focused ? t('exitFocus') : t('focus'),
                 'aria-pressed': focused,
                 onClick: () => setFocused((value) => !value),
               },
-              focused ? t('exitFocus') : t('focus'),
+              focused
+                ? h(
+                    Glyph,
+                    null,
+                    h('path', { d: 'M6 2.5V6H2.5' }),
+                    h('path', { d: 'M10 2.5V6h3.5' }),
+                    h('path', { d: 'M10 13.5V10h3.5' }),
+                    h('path', { d: 'M6 13.5V10H2.5' }),
+                  )
+                : h(
+                    Glyph,
+                    null,
+                    h('path', { d: 'M2.5 6V2.5H6' }),
+                    h('path', { d: 'M10 2.5h3.5V6' }),
+                    h('path', { d: 'M13.5 10v3.5H10' }),
+                    h('path', { d: 'M6 13.5H2.5V10' }),
+                  ),
             ),
           ),
         ),

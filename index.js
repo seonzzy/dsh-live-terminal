@@ -207,6 +207,24 @@ class Screen {
     return this.queue;
   }
 
+  /**
+   * Whether a typed command would be read by the shell rather than by a
+   * full-screen program.
+   *
+   * `buffer.type === 'alternate'` is the emulator's own record of a program
+   * that switched to the alternate screen (vim, htop, less, ssh): a command
+   * typed there belongs to that program, and would edit its buffer or be
+   * echoed as garbage. Everything else is the shell's own line — measured
+   * against a real PTY, a half-typed command stays on the normal buffer and the
+   * shell's clear command simply replaces it, which is what "clear" means.
+   * @returns the flags the clear path decides with.
+   */
+  screenState() {
+    const buffer = this.terminal.buffer.active;
+    const altScreen = buffer.type === 'alternate';
+    return { altScreen };
+  }
+
   /** The cursor's absolute row, counting scrollback. */
   get cursorRow() {
     const buffer = this.terminal.buffer.active;
@@ -300,6 +318,17 @@ class PlainScreen {
   /** Nothing to wait for. */
   get settled() {
     return Promise.resolve();
+  }
+
+  /**
+   * A text fallback has no screen modes to inspect, so it cannot tell a shell
+   * prompt from a full-screen program. Reporting `altScreen: false` means the
+   * caller types the shell's clear command, which is the same thing a user
+   * would do at a prompt; a program running in such a terminal is exactly the
+   * case this fallback was never able to render correctly anyway.
+   */
+  screenState() {
+    return { altScreen: false };
   }
 
   /** Approximate line count. */
@@ -447,6 +476,86 @@ class LiveSession {
     const data = this.pending;
     this.pending = '';
     this.broadcast({ type: 'output', data });
+  }
+
+  /**
+   * Clear the screen on BOTH sides, without disturbing a running program.
+   *
+   * A terminal's "clear" has to mean the same thing here and on the far side:
+   * the page shows one emulator and the model reads another, so a local wipe
+   * alone would leave them describing different screens. The portable way is
+   * the shell's own clear command, entered at its prompt:
+   *
+   * - `cls` for cmd.exe, `Clear-Host` for PowerShell, `clear` for a POSIX
+   *   shell. Those three cover everything `resolveShell` can start. Ctrl-L is
+   *   deliberately not used: it is a real key only in a POSIX-line-edited
+   *   shell, and Windows PowerShell — which is what this pool starts on
+   *   Windows — inserts it into the input line as a literal character.
+   * - A full-screen program (vim, htop, less, ssh) owns the screen and the
+   *   keyboard, so nothing is typed at all; both screens are wiped directly.
+   *
+   * @returns what was actually done, for the caller's log line.
+   */
+  async clearScreen() {
+    if (this.status !== 'running') {
+      /* Nothing is listening: wipe the authoritative screen so a later page
+       * replay starts clean. */
+      this.wipeScreen();
+      return { mode: 'wipe' };
+    }
+    const state = await this.screenState();
+    if (state.altScreen) {
+      this.wipeScreen();
+      return { mode: 'wipe', altScreen: true };
+    }
+    const name = String(this.shell?.name ?? '').toLowerCase();
+    const command =
+      name === 'cmd.exe' || name === 'cmd'
+        ? 'cls'
+        : name.startsWith('pwsh') || name.startsWith('powershell')
+          ? 'Clear-Host'
+          : 'clear';
+    this.lastActiveAt = Date.now();
+    /* The trailing CR is the Enter the shell needs; the command's own output
+     * (the cleared grid) then reaches the page and the Host screen through the
+     * ordinary output path, so both halves clear the same way. */
+    await this.handle.write(`${command}\r`);
+    return { mode: 'command', command };
+  }
+
+  /**
+   * Empty the authoritative screen and tell the pages to do the same.
+   *
+   * `\x1b[2J` clears the visible grid and `\x1b[3J` the scrollback; together
+   * with a cursor home they leave an empty screen at the top-left, exactly what
+   * a fresh terminal looks like. The emulator is fed the sequence rather than
+   * having its buffer poked, so every page's replay and the model's next read
+   * agree.
+   */
+  wipeScreen() {
+    try {
+      this.screen.write('\x1b[2J\x1b[3J\x1b[H');
+    } catch {
+      /* a disposed emulator: nothing left to clear */
+    }
+    this.revision += 1;
+    this.notify();
+  }
+
+  /**
+   * Ask the emulator whether a typed command would reach the shell.
+   *
+   * Parsing is asynchronous, so the queued bytes are drained first: a decision
+   * made on a half-parsed screen would read a stale buffer mode.
+   */
+  async screenState() {
+    await this.screen.settled;
+    const screen = this.screen;
+    if (typeof screen.screenState === 'function') return screen.screenState();
+    /* Neither screen implementation lacks this, but a custom one could: treat
+     * the shell as available, which types the command a user would have typed
+     * themselves. */
+    return { altScreen: false };
   }
 
   /** A JSON snapshot for the page. */
@@ -1001,6 +1110,12 @@ function controlHandler(pool, ctx, diagnostics, trace) {
         send(200, { ok: true, targetPgid: delivered });
         return;
       }
+      if (action === 'clear') {
+        const session = pool.require(key);
+        const result = await session.clearScreen();
+        send(200, { ok: true, ...result });
+        return;
+      }
       if (action === 'stop') {
         send(200, { ok: await pool.close(key) });
         return;
@@ -1119,6 +1234,7 @@ function vendorHandler(ctx) {
     ['/xterm.js', { path: fileURLToPath(new URL('./vendor/xterm.js', import.meta.url)), type: 'text/javascript; charset=utf-8' }],
     ['/xterm.css', { path: fileURLToPath(new URL('./vendor/xterm.css', import.meta.url)), type: 'text/css; charset=utf-8' }],
     ['/addon-fit.js', { path: fileURLToPath(new URL('./vendor/addon-fit.js', import.meta.url)), type: 'text/javascript; charset=utf-8' }],
+    ['/addon-webgl.js', { path: fileURLToPath(new URL('./vendor/addon-webgl.js', import.meta.url)), type: 'text/javascript; charset=utf-8' }],
   ]);
   return async (req, res) => {
     const path = new URL(req.url ?? '/', 'http://localhost').pathname;

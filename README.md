@@ -82,6 +82,7 @@ client.js              浏览器：DSH 右侧栏页签 + 终端画布
 vendor/xterm.js        终端模拟器 6.0.0（MIT，见 THIRD-PARTY-NOTICES.md）
 vendor/xterm.css
 vendor/addon-fit.js    尺寸自适应 0.11.0
+vendor/addon-webgl.js  WebGL 渲染器 0.19.0（无 WebGL 或 CSS zoom 下回落 DOM 渲染）
 cordis.patch.yml       一条 Host 行（id: live-terminal）
 locale/{en,zh}.json    插件页显示用的元数据
 icon.svg               插件图标
@@ -94,6 +95,7 @@ icon.svg               插件图标
 - 卸载插件会结束全部 shell 并断开所有镜像。
 - 想要 SSH：直接在面板里敲 `ssh 用户@主机` 即可；它就是终端，不需要额外适配。
 - 拖宽面板会触发重排：客户端对尺寸变化去抖、Host 端把一次拖动合并成一次 PTY 几何变更，结果切分又锚定在命令回显行上，所以重排不会污染 `live_terminal_run` 的返回值。
+- 「清屏」按钮发的是 shell 自己的清屏命令（PowerShell 用 `Clear-Host`，cmd 用 `cls`，POSIX 用 `clear`），再抹掉面板本地的 scrollback——本地画面和 Host 的权威屏幕因此始终一致。vim / htop 这类全屏程序占着屏幕时什么都不输入，只把两侧一起擦干净。不用 Ctrl-L：它在 Windows PowerShell 里不是清屏键，会被当成普通字符插进输入行。
 
 ## License
 
