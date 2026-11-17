@@ -1373,8 +1373,16 @@ function sliceAfterAnchor(text, anchor) {
  * typed at does not — a resize makes the shell redraw that row at coordinates
  * that can be stale, and the redraw is exactly what destroys the anchor. The
  * match is line-anchored (only whitespace before, nothing after) so a short
- * command like `ls` cannot latch onto ordinary output. Falls back to the
- * prompt-row anchor, then to the whole text.
+ * command like `ls` cannot latch onto ordinary output.
+ *
+ * A command longer than the pane is echoed ACROSS ROWS, and then it never
+ * appears on one line at all. Requiring the whole line is what made this fall
+ * through to the prompt anchor — and the anchor sits on the OLD prompt, above
+ * the echo, so the slice led with the echoed command and looked like "only the
+ * echo came back". The wrap-aware step below matches the command's FIRST
+ * segment after the prompt and cuts at the echo's end instead.
+ *
+ * Falls back to the prompt-row anchor, then to the whole text.
  * @param text - the full screen text after the command.
  * @param anchor - the prompt row captured before typing.
  * @param command - the line that was typed.
@@ -1388,8 +1396,56 @@ function sliceProduced(text, anchor, command) {
       pick = match.index + match[1].length;
     }
     if (pick >= 0) return text.slice(pick);
+
+    /* Wrapped echo: find the row that begins with the command's first segment
+     * right after a prompt, then skip the rows the echo occupies. */
+    const wrapped = wrappedEchoEnd(text, command);
+    if (wrapped >= 0) return text.slice(wrapped);
   }
   return sliceAfterAnchor(text, anchor);
+}
+
+/**
+ * End offset of a command echoed across several rows.
+ *
+ * A wrapped echo prints the command's characters without any newline of its
+ * own — the terminal wraps them — so the echo is identified by matching the
+ * command's opening characters after a prompt row and then walking forward
+ * through the text until the whole command has been consumed. Everything from
+ * there on is output.
+ *
+ * Windows line endings are normalised out first: the emulator separates rows
+ * with `\n`, and a `\r` inside a wrapped echo would break the character walk.
+ * @param text - the full screen text after the command.
+ * @param command - the line that was typed.
+ * @returns the offset just past the echo, or -1 when no echo is found.
+ */
+function wrappedEchoEnd(text, command) {
+  const typed = String(command);
+  if (typed.trim() === '') return -1;
+  /* The first segment is what visibly follows the prompt on the echo row. */
+  const head = typed.slice(0, Math.min(24, typed.length)).trimEnd();
+  if (head === '') return -1;
+  const pattern = new RegExp(`(?:^|\\n)[^\\n]*?(?:[$#>\u276f\u00bb\u203a] )?([ \\t]*${head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'u');
+  const match = pattern.exec(text);
+  if (match === null) return -1;
+  /* Walk from the start of that segment until every character of the command
+   * has been consumed, stepping over the row separators the terminal inserted. */
+  let at = match.index + (match[1].length === 0 ? 0 : match[0].length - match[1].length);
+  let remaining = typed.length;
+  while (at < text.length && remaining > 0) {
+    if (text[at] === '\n') {
+      at += 1;
+      continue;
+    }
+    at += 1;
+    remaining -= 1;
+  }
+  /* The echo may have been padded with blanks to the row's end; skip them and
+   * the row break so the result starts on the first output row. */
+  while (at < text.length && (text[at] === ' ' || text[at] === '\t')) at += 1;
+  if (text[at] === '\n') at += 1;
+  return at;
 }
 
 /**
