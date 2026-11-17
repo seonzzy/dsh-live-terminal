@@ -889,13 +889,19 @@ class LiveTerminals {
     while (Date.now() < deadline) {
       const seen = session.revision;
       await session.waitForOutput(Math.min(Date.now() + idle, deadline));
+      /* The prompt probe runs on EVERY pass, not only on a quiet one: output
+       * arrives in small chunks, so a command that finishes while its last
+       * chunk is still landing would otherwise keep the loop waiting for a
+       * silence that never comes. */
+      if (probe !== undefined) {
+        await session.screen.settled;
+        if (probe.finished?.() === true) break;
+      }
       if (session.revision !== seen) {
         quiet = 0;
         continue;
       }
       if (probe === undefined) break;
-      await session.screen.settled;
-      if (probe.finished?.() === true) break;
       quiet += 1;
       /* A program that talks but never returns a prompt is interactive; give
        * it a few windows to finish speaking, then hand back what it said. */
