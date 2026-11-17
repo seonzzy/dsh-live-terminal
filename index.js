@@ -1426,8 +1426,15 @@ function wrappedEchoEnd(text, command) {
   /* The first segment is what visibly follows the prompt on the echo row. */
   const head = typed.slice(0, Math.min(24, typed.length)).trimEnd();
   if (head === '') return -1;
-  const pattern = new RegExp(`(?:^|\\n)[^\\n]*?(?:[$#>\u276f\u00bb\u203a] )?([ \\t]*${head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'u');
-  const match = pattern.exec(text);
+  const stray = head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(`(?:^|\\n)[^\\n]*?(?:[$#>\u276f\u00bb\u203a] )?([ \\t]*${stray})`, 'gu');
+  /* The LAST occurrence, not the first: the scrollback still holds earlier
+   * commands, and two commands that open the same way (`Start-Sleep …`) would
+   * otherwise anchor this slice on the previous one — which is what returned a
+   * stale echo plus its neighbour's tail. The newest echo is the one that
+   * belongs to this invocation. */
+  let match = null;
+  for (let found = pattern.exec(text); found !== null; found = pattern.exec(text)) match = found;
   if (match === null) return -1;
   /* Walk from the start of that segment until every character of the command
    * has been consumed, stepping over the row separators the terminal inserted. */
