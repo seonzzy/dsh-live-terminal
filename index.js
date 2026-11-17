@@ -56,6 +56,12 @@ const SCROLLBACK = 5000;
 const DEFAULT_LIMIT = 6_000;
 /** Quiet window that ends a `live_terminal_run` wait. */
 const IDLE_MS = 1200;
+/** Quiet windows tolerated after real output before an interactive program's
+ *  transcript is handed back without a prompt. */
+const PROMPT_GRACE_WINDOWS = 2;
+/** Quiet windows after which a wait gives up even with no recognizable prompt:
+ *  the command printed nothing and something is wrong with the anchor. */
+const SILENT_GIVE_UP_WINDOWS = 6;
 /** Quiet window after the last geometry change before the PTY is really resized. */
 const RESIZE_SETTLE_MS = 120;
 /** Longest single wait, whatever the caller asks for. */
@@ -853,15 +859,52 @@ class LiveTerminals {
 
   /**
    * Wait until output stops, or the deadline passes.
+   *
+   * "Output stopped" is not the same as "the command finished": a shell echoes
+   * the command line immediately, and a command that thinks, compiles, sleeps
+   * or waits on the network says nothing for a while after that echo. Breaking
+   * on the first quiet window therefore returned the echo alone and dropped the
+   * result that landed a moment later — the reported "results are missing"
+   * symptom.
+   *
+   * A `finished` probe makes quiet mean "keep waiting": the screen is inspected
+   * after each quiet window and the wait goes on until the shell is back at its
+   * prompt. Two cases must still return early, and `sawOutput` decides them:
+   *
+   * - nothing beyond the echo has appeared — the command is almost certainly
+   *   still working, so keep waiting (this is the bug being fixed);
+   * - the command printed something and then went quiet without a prompt — an
+   *   interactive program (`ssh`, a REPL), so return what it printed rather
+   *   than hanging until the deadline.
+   *
+   * Callers that pass no probe keep the plain "first quiet window wins"
+   * behaviour.
    * @param session - the live session.
    * @param deadline - epoch millisecond bound.
    * @param idle - quiet window that ends the wait.
+   * @param probe - optional `{ finished, sawOutput }` callbacks.
    */
-  async collect(session, deadline, idle) {
+  async collect(session, deadline, idle, probe) {
+    let quiet = 0;
     while (Date.now() < deadline) {
       const seen = session.revision;
       await session.waitForOutput(Math.min(Date.now() + idle, deadline));
-      if (session.revision === seen) break;
+      if (session.revision !== seen) {
+        quiet = 0;
+        continue;
+      }
+      if (probe === undefined) break;
+      await session.screen.settled;
+      if (probe.finished?.() === true) break;
+      quiet += 1;
+      /* A program that talks but never returns a prompt is interactive; give
+       * it a few windows to finish speaking, then hand back what it said. */
+      if (quiet >= PROMPT_GRACE_WINDOWS && probe.sawOutput?.() === true) break;
+      /* The prompt could not be recognized at all (an empty template, or a
+       * shell whose prompt does not end in a terminator) and the command has
+       * printed nothing. Waiting to the deadline would stall every such call;
+       * a long, unbroken silence is the honest end here. */
+      if (quiet >= SILENT_GIVE_UP_WINDOWS) break;
     }
   }
 
@@ -911,10 +954,20 @@ class LiveTerminals {
     session.lastActiveAt = Date.now();
     await session.handle.write(`${text}\r`);
     const deadline = Date.now() + clampInt(options.waitMs, 500, MAX_WAIT_MS, 30_000);
-    await this.collect(session, deadline, clampInt(options.idleMs, 200, 10_000, IDLE_MS));
+    await this.collect(session, deadline, clampInt(options.idleMs, 200, 10_000, IDLE_MS), {
+      /* Back at a prompt means the command finished, whether it printed a
+       * screenful or nothing at all. */
+      finished: () => atPrompt(session.screen.text(0), anchor, text),
+      /* Real output beyond the echo: an interactive program that will never
+       * print another prompt is handed back after the grace windows. */
+      sawOutput: () => {
+        const produced = sliceProduced(session.screen.text(0), anchor, text);
+        return produced.split('\n').slice(1).some((line) => line.trim() !== '');
+      },
+    });
     await session.screen.settled;
     const produced = sliceProduced(session.screen.text(0), anchor, text);
-    return bound(produced, clampInt(options.limit, 200, 200_000, DEFAULT_LIMIT));
+    return bound(produced, clampInt(options.limit, 200, 200_000, DEFAULT_LIMIT));;
   }
 
   /**
@@ -1334,6 +1387,67 @@ function sliceProduced(text, anchor, command) {
 }
 
 /**
+ * Whether the shell is back at its prompt, judged from the LAST non-blank line.
+ *
+ * Two traps make a naive "last line starts with the prompt" test unusable:
+ *
+ * - the echoed command line itself starts with the prompt (`PS C:\…> ls`), and
+ *   during the silent stretch after the echo that line IS the last line, so it
+ *   would read as finished — the exact moment the wait must continue;
+ * - a wrapped echo puts the continuation on lines that start with neither.
+ *
+ * The prompt is therefore what remains once the typed command is stripped: a
+ * last line that is the prompt and nothing else. `atPrompt` asks for the row
+ * the command was typed at (its stable prefix) and the command text, so the
+ * echo can be recognized instead of mistaken for a fresh prompt.
+ *
+ * A blank template (the terminal was empty when the command was typed) cannot
+ * be recognized at all; the caller falls back to its grace windows.
+ * @param text - the full screen text.
+ * @param template - the prompt row captured before typing.
+ * @param command - the line that was typed.
+ */
+function atPrompt(text, template, command) {
+  const prompt = promptTemplate(template);
+  if (prompt === '') return false;
+  const lines = text.split('\n');
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].replace(/\s+$/u, '');
+    if (line.trim() === '') continue;
+    if (!line.startsWith(prompt)) return false;
+    const rest = line.slice(prompt.length).trim();
+    /* Only the prompt: the shell is idle. */
+    if (rest === '') return true;
+    /* The prompt followed by this very command is the ECHO, not a new prompt —
+     * unless the command has since been echoed a second time, which is what
+     * completion looks like (`…> cmd` …output… `…> `). */
+    const typed = String(command ?? '').trim();
+    if (typed !== '' && rest === typed) return false;
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Distill a prompt row into the stable prefix a later prompt must repeat.
+ *
+ * Everything after the visible prompt is dropped: a directory that changes, a
+ * branch, or the echoed command itself. The `>`/`$`/`#` that ends a prompt is
+ * kept, which is what makes `C:\>` and `PS C:\…>` recognizable while ordinary
+ * output lines — with no such terminator — are not.
+ * @param template - the prompt row captured before typing.
+ */
+function promptTemplate(template) {
+  const trimmed = String(template ?? '').replace(/\s+$/u, '');
+  if (trimmed === '') return '';
+  /* Keep up to and including the first prompt terminator; a row without one is
+   * not a prompt (an empty first row, a banner) and yields nothing. */
+  const at = trimmed.search(/[$#>\u276f\u00bb\u203a]\s*/u);
+  if (at < 0) return '';
+  return trimmed.slice(0, at + 1);
+}
+
+/**
  * Bound a tool result. Under `limit` the text is whole; over it, the head and
  * the tail survive and the omission is marked, so a long listing stays readable
  * without the whole file ever reaching the model.
@@ -1507,7 +1621,7 @@ export function apply(ctx, config) {
   ctx.tools.register({
     name: 'live_terminal_run',
     description:
-      'Type one line into the current conversation’s live terminal and return the text this command printed — not the whole screen — waiting until output falls quiet. Prefer this over the sandboxed shell when the user should watch the command run.',
+      'Type one line into the current conversation’s live terminal and return the text this command printed — not the whole screen. It waits until the shell is back at its prompt, so a command that goes quiet for a while before printing still returns its output. Prefer this over the sandboxed shell when the user should watch the command run.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1563,7 +1677,23 @@ export function apply(ctx, config) {
       await session.handle.write(args.submit === true ? `${decoded}\r` : decoded);
       session.broadcast({ type: 'note', at: Date.now(), text: `▶ ${JSON.stringify(decoded)}` });
       const wait = clampInt(args.waitMs, 0, 30_000, 1000);
-      if (wait > 0) await pool.collect(session, Date.now() + wait, 600);
+      if (wait > 0) {
+        /* Only a submitted line is a shell command whose completion a prompt
+         * reports. Raw bytes (a REPL keystroke, a password, an arrow key) leave
+         * the screen wherever the program put it, so they keep the plain
+         * quiet-window wait. */
+        const probe =
+          args.submit === true
+            ? {
+                finished: () => atPrompt(session.screen.text(0), anchor, decoded),
+                sawOutput: () => {
+                  const produced = sliceAfterAnchor(session.screen.text(0), anchor);
+                  return produced.split('\n').slice(1).some((line) => line.trim() !== '');
+                },
+              }
+            : undefined;
+        await pool.collect(session, Date.now() + wait, 600, probe);
+      }
       await session.screen.settled;
       if (wait === 0) return { text: '(已发送)' };
       const text = sliceAfterAnchor(session.screen.text(0), anchor);
