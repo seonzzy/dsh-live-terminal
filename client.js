@@ -435,13 +435,124 @@ window.__ModuleLoader__.load({
            * ancestor's CSS zoom (above), where a canvas backing store cannot
            * track the painted scale and the glyphs would blur, and any
            * environment without a usable WebGL context. */
-          if (zoomFactor() === 1) {
-            try {
-              const WebglCtor = window.WebglAddon?.WebglAddon;
-              if (typeof WebglCtor === 'function') instance.loadAddon(new WebglCtor());
-            } catch {
-              /* no WebGL here: the DOM renderer stays */
+          /* --------------------------------------------------------------
+           * WebGL renderer with automatic fallback to the DOM renderer.
+           *
+           * WebGL fails in two ways: the context is refused while loading
+           * (throws), or it is created yet paints nothing — a silent black
+           * canvas under high-DPI / a lost GPU context. BOTH must end in
+           * degradeWebgl(), which disposes the addon (its dispose restores
+           * the DOM renderer) and repaints. A first-frame pixel probe catches
+           * the silent case; onContextLoss catches a live loss.
+           * -------------------------------------------------------------- */
+          const webgl = { addon: undefined, active: false };
+          const traceWebgl = (detail) => {
+            void control('', { action: 'trace', tag: 'webgl', detail: String(detail).slice(0, 400) }).catch(() => undefined);
+          };
+          const degradeWebgl = (reason) => {
+            traceWebgl(`fallback: ${reason}`);
+            webgl.active = false;
+            const addon = webgl.addon;
+            webgl.addon = undefined;
+            if (addon !== undefined) {
+              try { addon.dispose(); } catch { /* already gone */ }
             }
+            try { instance.refresh(0, Math.max(0, instance.rows - 1)); } catch { /* mid-teardown */ }
+          };
+          const parseHex = (value) => {
+            const match = String(value ?? '').trim().match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+            if (match === null) return undefined;
+            let hex = match[1];
+            if (hex.length === 3) hex = hex.split('').map((c) => c + c).join('');
+            return {
+              r: Number.parseInt(hex.slice(0, 2), 16),
+              g: Number.parseInt(hex.slice(2, 4), 16),
+              b: Number.parseInt(hex.slice(4, 6), 16),
+            };
+          };
+
+          if (zoomFactor() === 1) {
+            const WebglCtor = window.WebglAddon?.WebglAddon;
+            if (typeof WebglCtor !== 'function') {
+              traceWebgl('addon unavailable; DOM renderer');
+            } else {
+              try {
+                /* preserveDrawingBuffer keeps pixels readable for the probe. */
+                const addon = new WebglCtor(true);
+                addon.onContextLoss?.(() => degradeWebgl('context lost'));
+                instance.loadAddon(addon);
+                webgl.addon = addon;
+                webgl.active = true;
+                traceWebgl(`loaded; dpr=${window.devicePixelRatio}`);
+
+                const probeWebgl = (label) => {
+                  if (disposed || !webgl.active) return;
+                  try {
+                    const canvas = instance.element?.querySelector('.xterm-screen canvas');
+                    const gl = canvas?.getContext('webgl2');
+                    if (gl === null || gl === undefined) {
+                      degradeWebgl(`${label}: no webgl2 context`);
+                      return;
+                    }
+                    const width = gl.drawingBufferWidth;
+                    const height = gl.drawingBufferHeight;
+                    const error = gl.getError();
+                    /* Only judge a blank canvas when there is text the
+                     * renderer should have painted; an empty screen has no
+                     * signal to compare against. */
+                    const buffer = instance.buffer.active;
+                    let hasText = false;
+                    for (let row = 0; row < buffer.length && !hasText; row += 1) {
+                      if ((buffer.getLine(row)?.translateToString() ?? '').trim() !== '') hasText = true;
+                    }
+                    let background = parseHex(instance.options.theme?.background);
+                    if (background === undefined) {
+                      const corner = new Uint8Array(4);
+                      gl.readPixels(width - 1, height - 1, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, corner);
+                      background = { r: corner[0], g: corner[1], b: corner[2] };
+                    }
+                    let painted = 0;
+                    const columns = 24;
+                    const rows = 12;
+                    for (let col = 0; col < columns; col += 1) {
+                      for (let row = 0; row < rows; row += 1) {
+                        const x = Math.floor((width * (col + 0.5)) / columns);
+                        const y = Math.floor((height * (row + 0.5)) / rows);
+                        const pixel = new Uint8Array(4);
+                        gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, pixel);
+                        if (
+                          pixel[3] > 0 &&
+                          (Math.abs(pixel[0] - background.r) > 24 ||
+                            Math.abs(pixel[1] - background.g) > 24 ||
+                            Math.abs(pixel[2] - background.b) > 24)
+                        ) {
+                          painted += 1;
+                        }
+                      }
+                    }
+                    traceWebgl(
+                      `${label}: dpr=${window.devicePixelRatio} buffer=${width}x${height} err=${error} text=${hasText} painted=${painted}`,
+                    );
+                    if (width <= 0 || height <= 0 || error !== gl.NO_ERROR) {
+                      degradeWebgl(`${label}: bad buffer`);
+                    } else if (hasText && painted === 0) {
+                      /* Text exists but the canvas is uniformly background —
+                       * the silent black-screen failure this fallback is for. */
+                      degradeWebgl(`${label}: blank canvas`);
+                    }
+                  } catch (failure) {
+                    degradeWebgl(`${label} threw: ${String(failure?.message ?? failure)}`);
+                  }
+                };
+                /* Two passes: the screen frame can arrive after the first. */
+                setTimeout(() => probeWebgl('probe1'), 700);
+                setTimeout(() => probeWebgl('probe2'), 1600);
+              } catch (failure) {
+                degradeWebgl(`load threw: ${String(failure?.message ?? failure)}`);
+              }
+            }
+          } else {
+            traceWebgl('skipped under css zoom; DOM renderer');
           }
           /* Fit only when the computed grid differs from the current one.
            *
