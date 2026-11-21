@@ -258,6 +258,29 @@ class Screen {
     return lines.join('\n');
   }
 
+  /**
+   * The last non-blank row of the buffer, right-trimmed.
+   *
+   * `text()` walks every retained row, which is the right shape for reading a
+   * screen and the wrong one for a question that only concerns its bottom line:
+   * with a full 5000-row scrollback a single `text()` call costs ~2.3ms, and the
+   * wait loop asks on every output chunk — enough to pin the Host's event loop
+   * during a chatty build. This walks backwards and stops at the first row with
+   * content in it, so it costs the same whether the scrollback is empty or
+   * full.
+   * @returns the row's text, or `''` when the buffer is blank.
+   */
+  lastLine() {
+    const buffer = this.terminal.buffer.active;
+    for (let index = buffer.length - 1; index >= 0; index -= 1) {
+      const line = buffer.getLine(index);
+      if (line === undefined) continue;
+      const value = line.translateToString(true).replace(/\s+$/u, '');
+      if (value.trim() !== '') return value;
+    }
+    return '';
+  }
+
   /** Replayable ANSI for a freshly opened page. */
   serialize() {
     if (this.serializeAddon === undefined) return '';
@@ -354,6 +377,16 @@ class PlainScreen {
     const slice = lines.slice(start);
     while (slice.length > 0 && slice[slice.length - 1].trim() === '') slice.pop();
     return slice.join('\n').replace(/\n{3,}/gu, '\n\n');
+  }
+
+  /** The last non-blank row, for callers that only need the bottom line. */
+  lastLine() {
+    const lines = this.data.split('\n');
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const value = lines[index].replace(/\s+$/u, '');
+      if (value.trim() !== '') return value;
+    }
+    return '';
   }
 
   /** No replay available. */
@@ -961,12 +994,17 @@ class LiveTerminals {
     await session.handle.write(`${text}\r`);
     const deadline = Date.now() + clampInt(options.waitMs, 500, MAX_WAIT_MS, 30_000);
     await this.collect(session, deadline, clampInt(options.idleMs, 200, 10_000, IDLE_MS), {
-      /* Back at a prompt means the command finished, whether it printed a
-       * screenful or nothing at all. */
-      finished: () => atPrompt(session.screen.text(0), anchor, text),
+      /* Only the bottom row is consulted, so this costs one row per check
+       * instead of a full scrollback walk per output chunk. */
+      finished: () => atPrompt(session.screen.lastLine(), anchor, text),
       /* Real output beyond the echo: an interactive program that will never
-       * print another prompt is handed back after the grace windows. */
+       * print another prompt is handed back after the grace windows. This one
+       * only runs on a quiet pass, so the full scan it needs is affordable —
+       * but it still short-circuits on the common case, where the last row is
+       * still the echo itself. */
       sawOutput: () => {
+        const last = session.screen.lastLine();
+        if (last === '') return false;
         const produced = sliceProduced(session.screen.text(0), anchor, text);
         return produced.split('\n').slice(1).some((line) => line.trim() !== '');
       },
@@ -1472,28 +1510,24 @@ function wrappedEchoEnd(text, command) {
  *
  * A blank template (the terminal was empty when the command was typed) cannot
  * be recognized at all; the caller falls back to its grace windows.
- * @param text - the full screen text.
+ * @param lastLine - the buffer's last non-blank row (`Screen.lastLine()`, not
+ *   the whole screen: the wait loop asks this on every output chunk, and a full
+ *   scan per chunk is what pinned the Host's event loop).
  * @param template - the prompt row captured before typing.
  * @param command - the line that was typed.
  */
-function atPrompt(text, template, command) {
+function atPrompt(lastLine, template, command) {
   const prompt = promptTemplate(template);
   if (prompt === '') return false;
-  const lines = text.split('\n');
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const line = lines[index].replace(/\s+$/u, '');
-    if (line.trim() === '') continue;
-    if (!line.startsWith(prompt)) return false;
-    const rest = line.slice(prompt.length).trim();
-    /* Only the prompt: the shell is idle. */
-    if (rest === '') return true;
-    /* The prompt followed by this very command is the ECHO, not a new prompt —
-     * unless the command has since been echoed a second time, which is what
-     * completion looks like (`…> cmd` …output… `…> `). */
-    const typed = String(command ?? '').trim();
-    if (typed !== '' && rest === typed) return false;
-    return false;
-  }
+  const line = String(lastLine ?? '').replace(/\s+$/u, '');
+  if (line.trim() === '') return false;
+  if (!line.startsWith(prompt)) return false;
+  const rest = line.slice(prompt.length).trim();
+  /* Only the prompt: the shell is idle. */
+  if (rest === '') return true;
+  /* The prompt followed by this very command is the ECHO, not a new prompt —
+   * unless the command has since been echoed a second time, which is what
+   * completion looks like (`…> cmd` …output… `…> `). */
   return false;
 }
 
@@ -1754,7 +1788,7 @@ export function apply(ctx, config) {
         const probe =
           args.submit === true
             ? {
-                finished: () => atPrompt(session.screen.text(0), anchor, decoded),
+                finished: () => atPrompt(session.screen.lastLine(), anchor, decoded),
                 sawOutput: () => {
                   const produced = sliceAfterAnchor(session.screen.text(0), anchor);
                   return produced.split('\n').slice(1).some((line) => line.trim() !== '');
