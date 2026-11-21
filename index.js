@@ -1480,15 +1480,35 @@ function wrappedEchoEnd(text, command) {
   /* Walk from the start of that segment until every character of the command
    * has been consumed, stepping over the row separators the terminal inserted. */
   let at = match.index + (match[1].length === 0 ? 0 : match[0].length - match[1].length);
-  let remaining = typed.length;
-  while (at < text.length && remaining > 0) {
-    if (text[at] === '\n') {
+  let ci = 0;
+  /* Walk the echo character by character against the typed command, tolerating
+   * whitespace differences at wrap points: a terminal folds a row that ends in
+   * a space and drops that space, so counting `typed.length` raw characters
+   * would land one byte into the real output (the first output row then loses
+   * its first character). Any whitespace on either side is skipped rather than
+   * counted; a non-space mismatch means the echo has ended. */
+  while (at < text.length && ci < typed.length) {
+    const ch = text[at];
+    if (ch === '\n') {
       at += 1;
       continue;
     }
-    at += 1;
-    remaining -= 1;
+    if (ch === typed[ci]) {
+      at += 1;
+      ci += 1;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t') {
+      at += 1;
+      continue;
+    }
+    if (typed[ci] === ' ' || typed[ci] === '\t') {
+      ci += 1;
+      continue;
+    }
+    break;
   }
+  if (ci < typed.length) return -1;
   /* The echo may have been padded with blanks to the row's end; skip them and
    * the row break so the result starts on the first output row. */
   while (at < text.length && (text[at] === ' ' || text[at] === '\t')) at += 1;
