@@ -1003,15 +1003,18 @@ class LiveTerminals {
        * but it still short-circuits on the common case, where the last row is
        * still the echo itself. */
       sawOutput: () => {
-        const last = session.screen.lastLine();
-        if (last === '') return false;
+        /* Cheap gate first: while the bottom row is still the echo (or a
+         * blank), no output has been produced, so the full scrollback walk
+         * below is skipped entirely. The expensive scan only runs once the
+         * screen has actually moved past the command. */
+        if (stillEcho(session.screen.lastLine(), anchor, text)) return false;
         const produced = sliceProduced(session.screen.text(0), anchor, text);
         return produced.split('\n').slice(1).some((line) => line.trim() !== '');
       },
     });
     await session.screen.settled;
     const produced = sliceProduced(session.screen.text(0), anchor, text);
-    return bound(produced, clampInt(options.limit, 200, 200_000, DEFAULT_LIMIT));;
+    return bound(produced, clampInt(options.limit, 200, 200_000, DEFAULT_LIMIT));
   }
 
   /**
@@ -1532,6 +1535,34 @@ function atPrompt(lastLine, template, command) {
 }
 
 /**
+ * Whether the bottom row is still this command's echo — i.e. no real output
+ * has appeared yet.
+ *
+ * Used as a cheap gate in front of the full-scrollback scans: an interactive
+ * program keeps the wait loop asking "did it print anything?" on every quiet
+ * window, and while the answer is "no, still just the echo" there is no reason
+ * to walk 5000 rows to find out. A blank row, a row that does not carry the
+ * prompt, or a row that carries only the prompt all count as "no output".
+ *
+ * The echo test is the same one `atPrompt` relies on: prompt prefix followed
+ * by (the beginning of) the typed command. Once the bottom row moves past
+ * that, output exists and the caller does the full scan.
+ * @param lastLine - the buffer's last non-blank row (`Screen.lastLine()`).
+ * @param template - the prompt row captured before typing.
+ * @param command - the line that was typed.
+ */
+function stillEcho(lastLine, template, command) {
+  const line = String(lastLine ?? '').replace(/\s+$/u, '');
+  if (line.trim() === '') return true;
+  const prompt = promptTemplate(template);
+  if (prompt === '') return false;
+  if (!line.startsWith(prompt)) return false;
+  const rest = line.slice(prompt.length).trim();
+  /* The bare prompt, or the prompt followed by (a prefix of) the command. */
+  return rest === '' || String(command).startsWith(rest);
+}
+
+/**
  * Distill a prompt row into the stable prefix a later prompt must repeat.
  *
  * Everything after the visible prompt is dropped: a directory that changes, a
@@ -1790,6 +1821,9 @@ export function apply(ctx, config) {
             ? {
                 finished: () => atPrompt(session.screen.lastLine(), anchor, decoded),
                 sawOutput: () => {
+                  /* Same cheap gate as `run`: don't walk the scrollback while
+                   * the bottom row is still the echo. */
+                  if (stillEcho(session.screen.lastLine(), anchor, decoded)) return false;
                   const produced = sliceAfterAnchor(session.screen.text(0), anchor);
                   return produced.split('\n').slice(1).some((line) => line.trim() !== '');
                 },
