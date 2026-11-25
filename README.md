@@ -82,7 +82,6 @@ client.js              浏览器：DSH 右侧栏页签 + 终端画布
 vendor/xterm.js        终端模拟器 6.0.0（MIT，见 THIRD-PARTY-NOTICES.md）
 vendor/xterm.css
 vendor/addon-fit.js    尺寸自适应 0.11.0
-vendor/addon-webgl.js  WebGL 渲染器 0.19.0（无 WebGL 或 CSS zoom 下回落 DOM 渲染）
 cordis.patch.yml       一条 Host 行（id: live-terminal）
 locale/{en,zh}.json    插件页显示用的元数据
 icon.svg               插件图标

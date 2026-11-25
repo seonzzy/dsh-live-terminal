@@ -1334,7 +1334,6 @@ function vendorHandler(ctx) {
     ['/xterm.js', { path: fileURLToPath(new URL('./vendor/xterm.js', import.meta.url)), type: 'text/javascript; charset=utf-8' }],
     ['/xterm.css', { path: fileURLToPath(new URL('./vendor/xterm.css', import.meta.url)), type: 'text/css; charset=utf-8' }],
     ['/addon-fit.js', { path: fileURLToPath(new URL('./vendor/addon-fit.js', import.meta.url)), type: 'text/javascript; charset=utf-8' }],
-    ['/addon-webgl.js', { path: fileURLToPath(new URL('./vendor/addon-webgl.js', import.meta.url)), type: 'text/javascript; charset=utf-8' }],
   ]);
   return async (req, res) => {
     const path = new URL(req.url ?? '/', 'http://localhost').pathname;

@@ -9,7 +9,6 @@ rather than being installed at runtime.
 | `xterm.js` | [`@xterm/xterm`](https://github.com/xtermjs/xterm.js) | 6.0.0 | MIT |
 | `xterm.css` | [`@xterm/xterm`](https://github.com/xtermjs/xterm.js) | 6.0.0 | MIT |
 | `addon-fit.js` | [`@xterm/addon-fit`](https://github.com/xtermjs/xterm.js) | 0.11.0 | MIT |
-| `addon-webgl.js` | [`@xterm/addon-webgl`](https://github.com/xtermjs/xterm.js) | 0.19.0 | MIT |
 
 ## MIT license text (as used by xterm.js)
 
