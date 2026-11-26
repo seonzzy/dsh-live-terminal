@@ -957,18 +957,23 @@ class LiveTerminals {
     while (Date.now() < deadline) {
       const seen = session.revision;
       await session.waitForOutput(Math.min(Date.now() + idle, deadline));
+      /* Let the parse catch up, but only briefly.
+       *
+       * `screen.settled` is the emulator's entire parse chain, and under a
+       * burst it takes tens of seconds to drain — awaiting it here turned an
+       * 8-second deadline into a 60-second call, because a pending await cannot
+       * be preempted by the loop condition. Skipping it entirely is wrong the
+       * other way: `lastLine()` reads the buffer synchronously, so on the first
+       * pass it can still show the OLD prompt row, which looks exactly like
+       * completion and made a command return its echo alone.
+       *
+       * A short bound gives the parser time to consume the chunks that have
+       * already arrived without ever inheriting the whole backlog. */
+      await session.screen.drain(60);
       /* The prompt probe runs on EVERY pass, not only on a quiet one: output
        * arrives in small chunks, so a command that finishes while its last
        * chunk is still landing would otherwise keep the loop waiting for a
-       * silence that never comes.
-       *
-       * It deliberately does NOT await `screen.settled` first. That getter is
-       * the emulator's whole parse chain, and under a burst of output it takes
-       * tens of seconds to drain — awaiting it inside this loop turned an
-       * 8-second deadline into a 60-second call, because a pending await cannot
-       * be preempted by the loop condition. `lastLine()` reads the buffer
-       * synchronously and may lag the newest bytes by one chunk, which costs
-       * nothing: the loop asks again on the next pass. */
+       * silence that never comes. */
       if (probe !== undefined && probe.finished?.() === true) break;
       if (session.revision !== seen) {
         quiet = 0;
