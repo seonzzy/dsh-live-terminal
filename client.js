@@ -367,7 +367,14 @@ window.__ModuleLoader__.load({
           const instance = new TerminalCtor({
             cols: 100,
             rows: 24,
-            scrollback: 5000,
+            /* Kept small on purpose. xterm's DOM renderer builds one element
+             * per cell, so the scrollback is a hard multiplier on live DOM
+             * nodes: 5000 rows × ~100 columns is roughly half a million nodes
+             * held for the life of the panel, and every reflow walks them.
+             * 500 rows still covers "scroll back a few screens" while keeping
+             * the node budget an order of magnitude lower. The authoritative
+             * screen on the Host keeps its own, larger history. */
+            scrollback: 500,
             cursorBlink: true,
             /* Consolas resolves everywhere on Windows and is真 monospace; the
              * generic stack can fall back to a proportional face, and xterm

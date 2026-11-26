@@ -50,8 +50,15 @@ const CONTROL_PATH = '/live-terminal';
 const STREAM_PATH = '/live-terminal/stream';
 /** Vendored browser terminal, served by this plugin. */
 const VENDOR_PATH = '/live-terminal/vendor';
-/** Scrollback kept by the authoritative screen. */
-const SCROLLBACK = 5000;
+/** Scrollback kept by the authoritative screen.
+ *
+ *  Deliberately modest: every retained row costs a `translateToString` walk
+ *  whenever the screen is read, and the panel mirrors this history into live
+ *  DOM nodes. 500 rows is a few screens of history — enough to read back what a
+ *  command printed — without turning the buffer into a performance liability.
+ *  (Measured: a full 5000-row buffer made a single `text()` call cost ~2.3ms,
+ *  which the wait loop used to pay on every output chunk.) */
+const SCROLLBACK = 500;
 /** Output a tool returns by default; longer results are elided in the middle. */
 const DEFAULT_LIMIT = 6_000;
 /** Quiet window that ends a `live_terminal_run` wait. */
@@ -214,6 +221,29 @@ class Screen {
   }
 
   /**
+   * Wait for the parse chain, but never longer than `ms`.
+   *
+   * `settled` is the emulator's entire backlog: a burst of output queues one
+   * parse per chunk, and draining thousands of them takes seconds. Callers
+   * that only need "the screen as it is now" — taking an anchor, reading a
+   * result — must not inherit that wait, because an unbounded await cannot be
+   * preempted by any deadline check around it. Whatever is still queued when
+   * the timer fires is simply left to finish on its own.
+   * @param ms - upper bound in milliseconds.
+   * @returns whether the queue drained within the bound.
+   */
+  async drain(ms) {
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), Math.max(0, ms));
+      timer.unref?.();
+    });
+    const outcome = await Promise.race([this.queue.then(() => 'drained'), timeout]);
+    clearTimeout(timer);
+    return outcome === 'drained';
+  }
+
+  /**
    * Whether a typed command would be read by the shell rather than by a
    * full-screen program.
    *
@@ -347,6 +377,11 @@ class PlainScreen {
   /** Nothing to wait for. */
   get settled() {
     return Promise.resolve();
+  }
+
+  /** Nothing is ever queued here, so a drain always succeeds immediately. */
+  async drain() {
+    return true;
   }
 
   /**
@@ -588,7 +623,7 @@ class LiveSession {
    * made on a half-parsed screen would read a stale buffer mode.
    */
   async screenState() {
-    await this.screen.settled;
+    await this.screen.drain(500);
     const screen = this.screen;
     if (typeof screen.screenState === 'function') return screen.screenState();
     /* Neither screen implementation lacks this, but a custom one could: treat
@@ -925,11 +960,16 @@ class LiveTerminals {
       /* The prompt probe runs on EVERY pass, not only on a quiet one: output
        * arrives in small chunks, so a command that finishes while its last
        * chunk is still landing would otherwise keep the loop waiting for a
-       * silence that never comes. */
-      if (probe !== undefined) {
-        await session.screen.settled;
-        if (probe.finished?.() === true) break;
-      }
+       * silence that never comes.
+       *
+       * It deliberately does NOT await `screen.settled` first. That getter is
+       * the emulator's whole parse chain, and under a burst of output it takes
+       * tens of seconds to drain — awaiting it inside this loop turned an
+       * 8-second deadline into a 60-second call, because a pending await cannot
+       * be preempted by the loop condition. `lastLine()` reads the buffer
+       * synchronously and may lag the newest bytes by one chunk, which costs
+       * nothing: the loop asks again on the next pass. */
+      if (probe !== undefined && probe.finished?.() === true) break;
       if (session.revision !== seen) {
         quiet = 0;
         continue;
@@ -982,12 +1022,13 @@ class LiveTerminals {
     }
     this.poke(rawKey);
     /* Settle the geometry first so the echo is captured at the width the
-     * command actually ran at, then give the shell's repaint room to land
-     * before the marker is taken. */
+     * command actually ran at. Bounded: the parse chain is the emulator's whole
+     * backlog, and a burst left over from an earlier command can take seconds
+     * to drain — the anchor only needs the screen as it is now, so a lagging
+     * parse is acceptable and an unbounded wait is not. */
     const resized = session.flushResize();
-    await session.screen.settled;
+    await session.screen.drain(250);
     if (resized) await session.waitForOutput(Date.now() + 250);
-    await session.screen.settled;
     const before = session.screen.text(0);
     const anchor = before.slice(before.lastIndexOf('\n') + 1);
     session.lastActiveAt = Date.now();
@@ -1003,16 +1044,14 @@ class LiveTerminals {
        * but it still short-circuits on the common case, where the last row is
        * still the echo itself. */
       sawOutput: () => {
-        /* Cheap gate first: while the bottom row is still the echo (or a
-         * blank), no output has been produced, so the full scrollback walk
-         * below is skipped entirely. The expensive scan only runs once the
-         * screen has actually moved past the command. */
         if (stillEcho(session.screen.lastLine(), anchor, text)) return false;
         const produced = sliceProduced(session.screen.text(0), anchor, text);
         return produced.split('\n').slice(1).some((line) => line.trim() !== '');
       },
     });
-    await session.screen.settled;
+    /* One last bounded drain so the slice below sees the newest rows; whatever
+     * is still queued after that is left to the emulator rather than awaited. */
+    await session.screen.drain(400);
     const produced = sliceProduced(session.screen.text(0), anchor, text);
     return bound(produced, clampInt(options.limit, 200, 200_000, DEFAULT_LIMIT));
   }
@@ -1822,7 +1861,7 @@ export function apply(ctx, config) {
       const session = pool.require(key);
       pool.poke(key);
       const decoded = decodeEscapes(String(args.text));
-      await session.screen.settled;
+      await session.screen.drain(250);
       /* Content anchor, same reason as `run`: row numbers drift on a reflow. */
       const before = session.screen.text(0);
       const anchor = before.slice(before.lastIndexOf('\n') + 1);
@@ -1850,7 +1889,7 @@ export function apply(ctx, config) {
             : undefined;
         await pool.collect(session, Date.now() + wait, 600, probe);
       }
-      await session.screen.settled;
+      await session.screen.drain(400);
       if (wait === 0) return { text: '(已发送)' };
       const text = sliceAfterAnchor(session.screen.text(0), anchor);
       return { text: text === '' ? '(没有新输出)' : bound(text, DEFAULT_LIMIT) };
@@ -1876,7 +1915,7 @@ export function apply(ctx, config) {
     async execute(args, exec) {
       const session = pool.sessionFor(keyOf(exec?.agent));
       if (session === undefined) return { text: '(这个会话还没有打开实时终端)' };
-      await session.screen.settled;
+      await session.screen.drain(400);
       const text = session.screen.text(0);
       const body = bound(text, clampInt(args?.limit, 200, 200_000, DEFAULT_LIMIT));
       return { text: `${body}\n\n[状态 ${session.status}；目录 ${session.cwd}]` };
