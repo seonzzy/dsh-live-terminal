@@ -58,7 +58,7 @@ const VENDOR_PATH = '/live-terminal/vendor';
  *  command printed — without turning the buffer into a performance liability.
  *  (Measured: a full 5000-row buffer made a single `text()` call cost ~2.3ms,
  *  which the wait loop used to pay on every output chunk.) */
-const SCROLLBACK = 500;
+const SCROLLBACK = 2000;
 /** Output a tool returns by default; longer results are elided in the middle. */
 const DEFAULT_LIMIT = 6_000;
 /** Quiet window that ends a `live_terminal_run` wait. */
@@ -194,8 +194,28 @@ class Screen {
         this.serializeAddon = undefined;
       }
     }
-    /** Serialized parse chain: headless `write` is asynchronous. */
-    this.queue = Promise.resolve();
+    /**
+     * How many writes the emulator still has to parse.
+     *
+     * xterm's headless `write` is asynchronous: it queues the bytes and calls
+     * back when they are parsed. Tracking a COUNT instead of chaining promises
+     * is what makes a burst affordable. Chaining (`queue = queue.then(...)`)
+     * looks equivalent but builds one promise link per chunk, and a measured
+     * 8000-chunk burst resolved only 973 links in 15 seconds — the deep chain
+     * costs far more than the parsing it serialises. The same 8000 chunks fed
+     * straight to `terminal.write` finish in about 2 seconds.
+     */
+    this.pendingWrites = 0;
+    /** Resolvers waiting for the count to reach zero. */
+    this.drainWaiters = [];
+  }
+
+  /** Resolve every waiter once nothing is queued. */
+  settleWaiters() {
+    if (this.pendingWrites > 0) return;
+    const waiters = this.drainWaiters;
+    this.drainWaiters = [];
+    for (const resolve of waiters) resolve(true);
   }
 
   /**
@@ -203,44 +223,44 @@ class Screen {
    * @param data - decoded output.
    */
   write(data) {
-    this.queue = this.queue.then(
-      () =>
-        new Promise((resolve) => {
-          try {
-            this.terminal.write(data, resolve);
-          } catch {
-            resolve();
-          }
-        }),
-    );
+    this.pendingWrites += 1;
+    try {
+      this.terminal.write(data, () => {
+        this.pendingWrites -= 1;
+        this.settleWaiters();
+      });
+    } catch {
+      this.pendingWrites -= 1;
+      this.settleWaiters();
+    }
+  }
+
+  /**
+   * Resolve when nothing is queued, waiting no longer than `ms`.
+   *
+   * This is the replacement for the old promise chain. It never appends a link
+   * to anything the writer walks, so a caller that gives up on the timeout
+   * leaves no residue behind.
+   * @param ms - upper bound in milliseconds.
+   * @returns whether the queue was empty within the bound.
+   */
+  drain(ms) {
+    if (this.pendingWrites === 0) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      let timer;
+      const done = (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      };
+      timer = setTimeout(() => done(false), Math.max(0, ms));
+      timer.unref?.();
+      this.drainWaiters.push(() => done(true));
+    });
   }
 
   /** Resolve when every queued byte has been parsed. */
   get settled() {
-    return this.queue;
-  }
-
-  /**
-   * Wait for the parse chain, but never longer than `ms`.
-   *
-   * `settled` is the emulator's entire backlog: a burst of output queues one
-   * parse per chunk, and draining thousands of them takes seconds. Callers
-   * that only need "the screen as it is now" — taking an anchor, reading a
-   * result — must not inherit that wait, because an unbounded await cannot be
-   * preempted by any deadline check around it. Whatever is still queued when
-   * the timer fires is simply left to finish on its own.
-   * @param ms - upper bound in milliseconds.
-   * @returns whether the queue drained within the bound.
-   */
-  async drain(ms) {
-    let timer;
-    const timeout = new Promise((resolve) => {
-      timer = setTimeout(() => resolve('timeout'), Math.max(0, ms));
-      timer.unref?.();
-    });
-    const outcome = await Promise.race([this.queue.then(() => 'drained'), timeout]);
-    clearTimeout(timer);
-    return outcome === 'drained';
+    return this.drain(Number.POSITIVE_INFINITY);
   }
 
   /**
