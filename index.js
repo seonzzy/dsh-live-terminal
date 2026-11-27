@@ -1733,9 +1733,57 @@ export function apply(ctx, config) {
   /** Page-side self-reports, newest last (see the `trace` control action). */
   const trace = [];
 
+  /* ------------------------------------------------------------------
+   * Browser-trust fence for every HTTP route this plugin owns.
+   *
+   * These routes drive a real PTY (the input action types arbitrary shell
+   * bytes), so they must not be reachable from a page the user happened to
+   * open in a browser. When ctx.connection is available (DSH >=0.2.2), its
+   * admit(req) applies the Host/Origin fence (DNS-rebinding and cross-site
+   * defence) plus the signed browser-session credential; without it a page
+   * on another origin could drive this terminal through a plain fetch. The
+   * Agent-side tools call the pool in-process and never touch these routes,
+   * so they are not affected. On harnesses without the connection service,
+   * fall back to a same-origin Origin/Host check so the panel keeps working.
+   * ------------------------------------------------------------------ */
+  let connectionService;
+  ctx.inject(['connection'], (sctx) => {
+    connectionService = sctx.get('connection');
+    return () => {
+      connectionService = undefined;
+    };
+  });
+  const sameOriginFallback = (req) => {
+    const origin = req.headers?.origin;
+    if (typeof origin !== 'string' || origin === '') return true;
+    try {
+      const u = new URL(origin);
+      const host = req.headers?.host;
+      return typeof host === 'string' && u.host.toLowerCase() === host.toLowerCase();
+    } catch {
+      return false;
+    }
+  };
+  const guard = (handler) => (req, res) => {
+    if (connectionService !== undefined && typeof connectionService.admit === 'function') {
+      const admission = connectionService.admit(req);
+      if (admission && typeof admission === 'object' && 'rejection' in admission) {
+        const status = admission.rejection === 401 ? 401 : 403;
+        res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
+        res.end(status === 401 ? 'unauthorized' : 'forbidden');
+        return;
+      }
+    } else if (!sameOriginFallback(req)) {
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+      res.end('forbidden');
+      return;
+    }
+    return handler(req, res);
+  };
+
   /* Routes first: the panel must find its endpoint even when no session exists,
    * which is exactly how it learns the session is idle. */
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: CONTROL_PATH, handler: controlHandler(pool, ctx, () => ({
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: CONTROL_PATH, handler: guard(controlHandler(pool, ctx, () => ({
     configExported: Config !== undefined,
     configSchema: Config === undefined ? null : Config.toJSON(),
     autoOpenPanel,
@@ -1759,12 +1807,12 @@ export function apply(ctx, config) {
         return 'entries() unavailable';
       }
     })(),
-  }), trace) }), 'live-terminal: control route');
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: STREAM_PATH, handler: streamHandler(pool) }),
+  }), trace)) }), 'live-terminal: control route');
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: STREAM_PATH, handler: guard(streamHandler(pool)) }),
     'live-terminal: stream route');
-  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: VENDOR_PATH, handler: vendorHandler(ctx) }),
+  ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: VENDOR_PATH, handler: guard(vendorHandler(ctx)) }),
     'live-terminal: vendor route');
-  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: SIGNAL_PATH, handler: signalHandler(signals) }),
+  ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: SIGNAL_PATH, handler: guard(signalHandler(signals)) }),
     'live-terminal: signal route');
 
   /* A settings save reaches the running plugin here, so flipping the switch
